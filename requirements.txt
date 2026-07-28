@@ -1,0 +1,7 @@
+# Tek .venv ile (Docker'sız) çalışan geliştirme kurulumu: her iki tarafı da kurar.
+#   .venv/Scripts/pip install -r requirements.txt
+#
+# Docker imajları bunu KULLANMAZ; her servis kendi dosyasını kurar, böylece frontend
+# imajı chromadb/langchain taşımaz.
+-r requirements-backend.txt
+-r requirements-frontend.txt

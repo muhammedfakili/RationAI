@@ -1,0 +1,29 @@
+# RationAI backend (FastAPI + solver + RAG + agent).
+# Doğrudan import edilen paketler pinlenir; geçişli bağımlılıkları pip çözer.
+# Frontend'in ihtiyaçları requirements-frontend.txt'te — bu dosya streamlit çekmez.
+
+# API
+fastapi==0.139.2
+uvicorn==0.51.0
+pydantic==2.13.4
+
+# Veritabanı (SQLite yereldeki varsayılan, PostgreSQL docker compose'ta)
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
+python-dotenv==1.2.2
+
+# Rasyon optimizasyonu — CBC çözücüsü tekerlek içinde gelir (linux/glibc gerekir,
+# bu yüzden imaj Alpine değil slim tabanlıdır).
+PuLP==3.3.2
+
+# Fiyat scraper'ı (borsa.tobb.org.tr)
+requests==2.34.2
+beautifulsoup4==4.15.0
+
+# RAG + ajan
+chromadb==1.5.9
+langchain-core==1.4.9
+langchain-groq==1.1.3
+langchain-text-splitters==1.1.2
+langgraph==1.2.9
+typing_extensions==4.16.0

@@ -1,0 +1,19 @@
+# Sırlar — .env içinde gerçek GROQ_API_KEY var, asla commit edilmemeli.
+# Şablon için .env.example'a bakın.
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Yerel veri (Docker'da Postgres volume'u ve imaja gömülü indeks kullanılır)
+rationai.db
+data/chroma_db/
+
+# Araç/IDE
+.claude/
+.idea/
+.vscode/
+.DS_Store

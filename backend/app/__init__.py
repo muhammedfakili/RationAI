@@ -1,0 +1,1 @@
+"""RationAI backend application package."""

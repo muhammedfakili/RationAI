@@ -1,0 +1,7 @@
+# RationAI Streamlit arayüzü.
+# Backend ile yalnızca HTTP üzerinden konuşur, bu yüzden chromadb/langchain/pulp GEREKMEZ.
+
+streamlit==1.60.0
+altair==6.2.2
+pandas==3.0.5
+requests==2.34.2

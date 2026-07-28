@@ -1,0 +1,24 @@
+# Build context'i küçük tutar. .venv tek başına ~700 MB; dışlanmazsa her build'de
+# Docker daemon'a kopyalanır.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Yerel veri: konteyner Postgres ve imaja gömülü ChromaDB indeksi kullanır.
+rationai.db
+data/chroma_db/
+
+# Sırlar ve yerel ayarlar — .env ASLA imaja girmez, değerler compose'tan gelir.
+.env
+.git/
+.gitignore
+.claude/
+.plans/
+
+# Windows'a özgü yardımcılar ve dokümantasyon imajda gerekmez.
+kill_ports.ps1
+CLAUDE.md
+README.md
+
+# data/docs/ BİLEREK dışlanmadı: backend imajı build sırasında oradan ingest ediyor.

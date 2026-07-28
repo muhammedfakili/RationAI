@@ -1,0 +1,52 @@
+# RationAI — tek komutla ayağa kalkan tam yığın:
+#   cp .env.example .env  &&  docker compose up
+#
+# GROQ_API_KEY opsiyoneldir. Anahtarsız da arayüz, rasyon optimizasyonu, yem listesi,
+# fiyat senkronu ve RAG araması çalışır; yalnızca /api/v1/agent/query 503 döner.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rationai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rationai}
+      POSTGRES_DB: ${POSTGRES_DB:-rationai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # backend, bu kontrol geçmeden başlamaz (aşağıdaki service_healthy koşulu).
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rationai} -d ${POSTGRES_DB:-rationai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rationai}:${POSTGRES_PASSWORD:-rationai}@db:5432/${POSTGRES_DB:-rationai}
+      # Boş bırakılabilir: sohbet kapanır, gerisi çalışır.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      # Konteyner ağında backend'e servis adıyla erişilir.
+      BACKEND_URL: http://backend:8000/api/v1
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+
+volumes:
+  pgdata:

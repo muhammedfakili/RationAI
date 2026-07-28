@@ -1,0 +1,331 @@
+"""RationAI - TOBB ticaret borsalarından canlı yem fiyatı çekme.
+
+Kaynak: https://borsa.tobb.org.tr/fiyat_borsa.php?borsakod=<KOD>
+TOBB'un birleşik portalı; her borsa aynı HTML tablo yapısını kullanır:
+
+    Ürün Adı | Birim | Son İşlem Tarihi | En Az (TL) | En Çok (TL) |
+    Ortalama (TL) | İşlem Miktarı | İşlem Adeti | İşlem Tutarı (TL)
+
+KAPSAM SINIRI (önemli): borsalar yalnızca TAHIL DANESİ işlem görüyor — mısır, arpa,
+buğday, yulaf, tritikale, nohut. TOBB'da KÜSPELER grubu boş, ÇEŞİTLİ MADDELER'de sadece
+kimyon/süpürge teli var; silaj, yonca ve saman borsada hiç işlem görmüyor (yerel pazar).
+Bu yüzden 37 yemin ~6'sı canlı çekilir, kalanı `database._CURATED_FEEDS` taban fiyatında
+kalır. Hangi fiyatın canlı hangisinin taban olduğu `Feed.price_source` alanında tutulur ve
+arayüzde gösterilir — sessizce "canlı" numarası yapılmaz.
+"""
+
+import logging
+import re
+import statistics
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+import requests
+from bs4 import BeautifulSoup
+from sqlalchemy.orm import Session
+
+from .models import Feed
+
+logger = logging.getLogger(__name__)
+
+TOBB_BASE_URL = "https://borsa.tobb.org.tr/fiyat_borsa.php"
+TOBB_INDEX_URL = "https://borsa.tobb.org.tr/fiyat_borsa0.php"
+
+# Tahıl işlemi yoğun borsalar. Liste `fiyat_borsa0.php`'den genişletilebilir;
+# bayat veri tazelik filtresiyle zaten elenir.
+TOBB_EXCHANGES = {
+    "5BA20": "Bandırma TB",
+    "5ES10": "Eskişehir TB",
+    "5SU10": "Sungurlu TB",
+    "5ED10": "Edirne TB",
+    "5IL10": "Ilgın TB",
+    "5CO20": "Çorum TB",
+    "5AL05": "Alaca TB",
+    "5AK30": "Akşehir TB",
+    "5KA40": "Karapınar TB",
+    "5UZ10": "Uzunköprü TB",
+    "5BI10": "Biga TB",
+    "5NA10": "Nazilli TB",
+    "5KO10": "Konya TB",
+}
+
+# TOBB ürün adının İLK KELİMESİ -> veritabanındaki yem adı.
+# İlk kelimeyle eşleme kasıtlı: "MISIR SARI" dane mısırdır ama "MISIR KEPEĞİ" değildir,
+# "FİĞ" dane fiğdir ama bizim "Fiğ Kuru Otu"muz kaba yemdir. Karışmasın diye
+# `_EXCLUDED_TOKENS` ile ikinci kelimeler elenir.
+TOBB_PRODUCT_PREFIX = {
+    "ARPA": "Arpa",
+    "MISIR": "Mısır",
+    "BUĞDAY": "Buğday",
+    "YULAF": "Yulaf",
+    "TRİTİKALE": "Tritikale",
+    "NOHUT": "Nohut",
+}
+
+# Ürün adının devamında bunlardan biri geçiyorsa eşleme İPTAL edilir: dane değil,
+# işlenmiş/kaba yem ürünüdür.
+_EXCLUDED_TOKENS = (
+    "KEPEK", "KEPEĞİ", "KÜSPE", "KÜSPESİ", "SİLAJ", "SİLAJI", "SAMAN", "SAMANI",
+    "UNU", "NİŞASTA", "GLUTEN", "HASIL", "YAĞ", "TOHUM", "KALBURALTI",
+)
+
+# Çekilen fiyat taban fiyatın bu katsayı aralığı dışındaysa reddedilir.
+# Gerekli: aynı portalda dana eti 587 TL/kg, zeytinyağı 220 TL/kg satırları var ve
+# TOBB bazı satırları "12.007,000" gibi tutarsız biçimlendiriyor.
+PRICE_SANITY_MIN_FACTOR = 0.3
+PRICE_SANITY_MAX_FACTOR = 3.0
+
+# Bu kadar günden eski işlem verisi kullanılmaz. Konya borsası Temmuz'da hâlâ
+# Mayıs verisi gösteriyordu - filtre olmadan bayat fiyat "canlı" diye kaydedilirdi.
+MAX_PRICE_AGE_DAYS = 30
+
+
+@dataclass
+class FeedPrice:
+    """Bir yem için çekilmiş fiyat."""
+    name: str
+    price_per_kg: float          # TL/kg (doğal hali)
+    source: str                  # "Bandırma TB (+3 borsa)"
+    date: str                    # ISO tarih
+    sample_count: int = 1
+    unit: str = "TL/kg"
+
+
+def _parse_turkish_number(text: str) -> List[float]:
+    """Türkçe biçimli sayının olası okumalarını döndürür.
+
+    TOBB tutarlı değil: aynı sütunda hem `13,570` (= 13.570) hem `12.007,000`
+    (aslında 12.007) geçiyor. Tek bir doğru yorum olmadığı için olası okumaların
+    hepsi döndürülür, hangisinin gerçek olduğuna akıl sağlığı bandı karar verir.
+    """
+    cleaned = text.strip().replace(" ", "").replace("\xa0", "")
+    if not cleaned or not re.search(r"\d", cleaned):
+        return []
+
+    candidates = []
+    # Standart tr-TR: nokta binlik, virgül ondalık
+    try:
+        candidates.append(float(cleaned.replace(".", "").replace(",", ".")))
+    except ValueError:
+        pass
+    # Alternatif: nokta ondalık, sondaki ",000" biçim artığı
+    alt = cleaned.split(",")[0]
+    try:
+        candidates.append(float(alt))
+    except ValueError:
+        pass
+
+    return [c for c in candidates if c > 0]
+
+
+def _parse_date(text: str) -> Optional[datetime]:
+    """'28.07.2026 11:17' -> datetime."""
+    match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", text or "")
+    if not match:
+        return None
+    day, month, year = (int(g) for g in match.groups())
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def _match_product(product_name: str) -> Optional[str]:
+    """TOBB ürün adını veritabanı yem adına eşler; dane olmayanları eler."""
+    upper = product_name.upper().strip()
+    if not upper:
+        return None
+
+    first_token = re.split(r"[\s(/,.]+", upper, maxsplit=1)[0]
+    feed_name = TOBB_PRODUCT_PREFIX.get(first_token)
+    if feed_name is None:
+        return None
+
+    remainder = upper[len(first_token):]
+    if any(token in remainder for token in _EXCLUDED_TOKENS):
+        return None
+
+    return feed_name
+
+
+class TurkishFeedPriceScraper:
+    """TOBB borsa portalından tahıl fiyatlarını çeker."""
+
+    def __init__(self, timeout: int = 15, base_prices: Optional[Dict[str, float]] = None):
+        self.timeout = timeout
+        self.base_prices = base_prices or {}
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+        })
+
+    def _plausible_price(self, feed_name: str, candidates: List[float]) -> Optional[float]:
+        """Olası okumalar içinden taban fiyata göre makul olanı seçer."""
+        base = self.base_prices.get(feed_name)
+        if base is None or base <= 0:
+            # Taban yoksa yem fiyatı için genel bir bant uygula
+            return next((c for c in candidates if 0.5 <= c <= 200.0), None)
+        low, high = base * PRICE_SANITY_MIN_FACTOR, base * PRICE_SANITY_MAX_FACTOR
+        return next((c for c in candidates if low <= c <= high), None)
+
+    def scrape_exchange(self, code: str, label: str) -> List[FeedPrice]:
+        """Tek bir borsanın fiyat tablosunu çeker."""
+        prices: List[FeedPrice] = []
+        cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
+
+        try:
+            resp = self.session.get(TOBB_BASE_URL, params={"borsakod": code}, timeout=self.timeout)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            table = BeautifulSoup(resp.text, "html.parser").find("table")
+            if table is None:
+                return prices
+
+            for row in table.find_all("tr")[1:]:
+                cells = [c.get_text(" ", strip=True) for c in row.find_all("td")]
+                if len(cells) < 6:
+                    continue
+
+                feed_name = _match_product(cells[0])
+                if feed_name is None:
+                    continue
+
+                # Birim sütunu KG değilse tahmin yürütme, atla.
+                if cells[1].strip().upper() not in ("KG", "KİLOGRAM"):
+                    continue
+
+                traded_at = _parse_date(cells[2])
+                if traded_at is None or traded_at < cutoff:
+                    continue
+
+                price = self._plausible_price(feed_name, _parse_turkish_number(cells[5]))
+                if price is None:
+                    continue
+
+                prices.append(FeedPrice(
+                    name=feed_name,
+                    price_per_kg=round(price, 2),
+                    source=label,
+                    date=traded_at.date().isoformat(),
+                ))
+        except Exception as exc:
+            logger.warning("TOBB %s (%s) çekilemedi: %s", label, code, exc)
+
+        return prices
+
+    def scrape_all(self) -> Dict[str, FeedPrice]:
+        """Tüm borsaları gezip yem başına medyan fiyatı döndürür."""
+        collected: Dict[str, List[FeedPrice]] = {}
+
+        for code, label in TOBB_EXCHANGES.items():
+            for price in self.scrape_exchange(code, label):
+                collected.setdefault(price.name, []).append(price)
+
+        results: Dict[str, FeedPrice] = {}
+        for feed_name, samples in collected.items():
+            median_price = statistics.median(p.price_per_kg for p in samples)
+            newest = max(samples, key=lambda p: p.date)
+            sources = {p.source for p in samples}
+            label = newest.source
+            if len(sources) > 1:
+                label = f"{newest.source} (+{len(sources) - 1} borsa)"
+
+            results[feed_name] = FeedPrice(
+                name=feed_name,
+                price_per_kg=round(median_price, 2),
+                source=label,
+                date=newest.date,
+                sample_count=len(samples),
+            )
+
+        logger.info("TOBB: %d yem için canlı fiyat bulundu", len(results))
+        return results
+
+
+# =====================================================================
+# PUBLIC API
+# =====================================================================
+
+def _curated_base_prices() -> Dict[str, float]:
+    """Taban fiyatlar tek kaynaktan: küratörlü yem tablosu."""
+    from .database import _get_curated_feeds
+    return {feed["name"]: feed["price_per_kg"] for feed in _get_curated_feeds()}
+
+
+def update_feed_prices(
+    db: Session,
+    price_updates: Optional[Dict[str, float]] = None,
+) -> Dict[str, object]:
+    """Yem fiyatlarını canlı borsadan (veya verilen sözlükten) günceller.
+
+    Args:
+        db: Veritabanı oturumu
+        price_updates: Verilirse canlı çekim yapılmaz, bu fiyatlar elle uygulanır.
+
+    Returns:
+        {"updated": [Feed], "live_count": int, "source": str, "details": {ad: kaynak}}
+        Canlı kaynak bulunamazsa fiyatlara DOKUNULMAZ ve live_count 0 döner —
+        eskiden burada sessizce rastgele bir simülasyon çalışıyordu.
+    """
+    now = datetime.now()
+    details: Dict[str, str] = {}
+    updated: List[Feed] = []
+
+    if price_updates is not None:
+        source_label = "elle girildi"
+        resolved = {name: (price, source_label, now) for name, price in price_updates.items()}
+    else:
+        scraper = TurkishFeedPriceScraper(base_prices=_curated_base_prices())
+        scraped = scraper.scrape_all()
+        source_label = "TOBB borsa"
+        resolved = {
+            name: (fp.price_per_kg, f"{fp.source} · {fp.date}", now)
+            for name, fp in scraped.items()
+        }
+
+    for feed_name, (new_price, source, stamp) in resolved.items():
+        feed = db.query(Feed).filter(Feed.name == feed_name).first()
+        if feed is None:
+            logger.warning("Veritabanında bulunmayan yem atlandı: %s", feed_name)
+            continue
+        logger.debug("%s: %.2f -> %.2f (%s)", feed_name, feed.price_per_kg or 0, new_price, source)
+        feed.price_per_kg = new_price
+        feed.price_source = source
+        feed.price_updated_at = stamp
+        updated.append(feed)
+        details[feed_name] = source
+
+    if updated:
+        db.commit()
+
+    total_feeds = db.query(Feed).count()
+    return {
+        "updated": updated,
+        "live_count": len(updated),
+        "baseline_count": max(total_feeds - len(updated), 0),
+        "source": source_label,
+        "details": details,
+    }
+
+
+def get_current_market_prices(db: Session) -> Dict[str, float]:
+    """Veritabanındaki güncel fiyatlar; tablo boşsa küratörlü taban fiyatlar."""
+    feeds = db.query(Feed).all()
+    if feeds:
+        return {f.name: f.price_per_kg for f in feeds}
+    return _curated_base_prices()
+
+
+def fetch_live_prices_only() -> Dict[str, FeedPrice]:
+    """Veritabanına yazmadan canlı fiyatları çeker (teşhis/test için)."""
+    return TurkishFeedPriceScraper(base_prices=_curated_base_prices()).scrape_all()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    for name, fp in sorted(fetch_live_prices_only().items()):
+        print(f"{name:<12} {fp.price_per_kg:>7.2f} TL/kg  {fp.source} · {fp.date} "
+              f"({fp.sample_count} kayıt)")
