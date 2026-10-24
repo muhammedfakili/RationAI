@@ -19,19 +19,12 @@ import streamlit as st
 # Varsayılan localhost, konteynersiz `quickstart.py` akışı bozulmasın diye korunur.
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/api/v1")
 
-# Süt ineği için pratik mineral hedefleri (rasyon kuru maddesinin yüzdesi).
-DEFAULT_CA_MIN, DEFAULT_CA_MAX = 0.60, 1.20
-DEFAULT_P_MIN, DEFAULT_P_MAX = 0.35, 0.70
-
-# Otomatik hedeflerde alt sınırın üstüne eklenen bant.
-# ⚠️ HP bandı dar tutulmamalı: kaba yem oranı ve NDF kısıtları yoncayı/soyayı rasyona
-# sokunca protein doğal olarak yükselir. 2.5 puanlık bantta silajsız rasyonlar ve
-# yüksek verimli inekler gereksiz yere "gevşetilmiş" moda düşüyordu.
-CP_BAND, ME_BAND = 4.0, 0.5
-
-# Solver'ın uyguladığı rasyon kuralları (backend/app/optimization.py ile aynı değerler).
-NDF_TARGET_MIN, NDF_TARGET_MAX = 28.0, 35.0
-FORAGE_TARGET_MIN, FORAGE_TARGET_MAX = 45.0, 65.0
+# Hedefler (NASEM 2021) ve grubun rasyon kuralları backend'den gelir: /requirements.
+GROUP_LABELS = {
+    "lactating": "Sağmal",
+    "dry_faroff": "Kuru (erken)",
+    "dry_closeup": "Kuru (doğuma yakın)",
+}
 
 # Yem sınıfı -> seçim grubu
 FORAGE_TYPES = ("silage", "hay", "straw")
@@ -66,6 +59,23 @@ def fetch_feeds() -> List[Dict]:
         return []
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _post_requirements(profile_items: Tuple) -> Dict:
+    # Hata istisna olarak çıkar; st.cache_data istisnaları önbelleğe almaz.
+    response = requests.post(f"{BACKEND_URL}/requirements", json=dict(profile_items), timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_requirements(profile: Dict) -> Optional[Dict]:
+    """Hayvan profilinin NASEM 2021 ihtiyaçları + grubun rasyon kuralları."""
+    try:
+        return _post_requirements(tuple(sorted(profile.items())))
+    except Exception as exc:
+        st.error(f"İhtiyaç hesaplanamadı: {exc}", icon=":material/error:")
+        return None
+
+
 def call_optimization_api(payload: Dict) -> Optional[Dict]:
     """Deterministik optimizasyon uç noktasını çağır.
 
@@ -87,52 +97,12 @@ def call_optimization_api(payload: Dict) -> Optional[Dict]:
 
 
 # ============================
-# BESLEME HESAPLARI
+# İSTEK GÖVDESİ
 # ============================
-
-def estimate_dm_intake(body_weight_kg: float, milk_yield_kg: float) -> float:
-    """Günlük kuru madde tüketimi (kg/gün) — NRC pratik yaklaşımı.
-
-    0.02 x canlı ağırlık + 0.35 x günlük süt. 600 kg / 30 kg süt -> 22.5 kg KM.
-    """
-    return 0.02 * body_weight_kg + 0.35 * milk_yield_kg
-
-
-def estimate_requirements(
-    body_weight_kg: float,
-    milk_yield_kg: float,
-    dm_intake_kg: float,
-) -> Tuple[float, float]:
-    """Süt ineğinin HP ve ME ihtiyacını KM KONSANTRASYONUNA çevirir.
-
-    Önce günlük TOPLAM ihtiyaç (kg HP/gün, Mcal ME/gün) hesaplanır, sonra günlük
-    kuru madde tüketimine bölünerek solver'ın beklediği birime geçilir:
-      HP -> % KM,  ME -> Mcal/kg KM
-
-    ⚠️ Toplam ihtiyaç ile konsantrasyonu karıştırma. 600 kg / 30 kg sütlük bir inek
-    günde ~3.4 kg HP ve ~53 Mcal ME ister; bu 22 kg KM tüketiminde %15.5 HP ve
-    2.4 Mcal/kg KM eder. Bölme adımı atlanırsa hedefler fizyolojik olarak
-    imkânsız seviyelere çıkar ve rasyon her zaman "gevşetilmiş" döner.
-
-    Katsayılar NRC 2001 pratik yaklaşımlarıdır:
-      - İdame HP : 0.0012 x CA (kg/gün)
-      - Süt HP   : 0.090 kg HP / kg süt (%3.2 gerçek protein / 0.65 verim)
-      - İdame ME : 0.13 x CA^0.75 (Mcal/gün)
-      - Süt ME   : 1.25 Mcal / kg süt (NEl 0.74 / 0.60 verim)
-    """
-    if dm_intake_kg <= 0:
-        return 0.0, 0.0
-
-    cp_kg_day = 0.0012 * body_weight_kg + 0.090 * milk_yield_kg
-    me_mcal_day = 0.13 * body_weight_kg ** 0.75 + 1.25 * milk_yield_kg
-
-    return (cp_kg_day / dm_intake_kg) * 100.0, me_mcal_day / dm_intake_kg
-
 
 def build_optimization_payload(
     selected_feeds: List[str],
-    body_weight_kg: float,
-    milk_yield_kg: float,
+    animal: Dict,
     targets: Dict,
     use_all_feeds: bool,
     min_inclusion_pct_dm: float,
@@ -141,37 +111,35 @@ def build_optimization_payload(
 ) -> Dict:
     """POST /api/v1/optimize için istek gövdesi üretir.
 
+    Hayvan profili her zaman gider: backend hedefleri (NASEM 2021) ve grubun rasyon
+    kurallarını ondan türetir. Hedefler yalnızca elle ayarlandıysa açıkça gönderilir
+    ve profilden gelenlerin önüne geçer.
+
     ⚠️ BİRİM DÖNÜŞÜMÜ: Arayüz Ca ve P'yi rasyon YÜZDESİ olarak toplar (nutrisyonistlerin
     alıştığı gösterim), backend ise g/kg KM bekler. %1 KM = 10 g/kg KM olduğundan
     burada 10 ile çarpılır. Bu dönüşüm atlanırsa hedefler 10 kat düşük gider ve
     Ca:P oranı hiçbir zaman tutmaz.
     """
-    dm_intake_kg = targets["dm_intake_kg"]
-    cp_req, me_req = estimate_requirements(body_weight_kg, milk_yield_kg, dm_intake_kg)
-
-    # Hayvanın hesaplanan ihtiyacı ile kullanıcının alt sınırından hangisi daha
-    # talepkârsa o hedeflenir; sonra kullanıcının üst sınırına kırpılır (yoksa
-    # min > max olur ve kısıt anlamsızlaşır).
-    cp_target = min(max(targets["cp_min"], cp_req), targets["cp_max"])
-    me_target = min(max(targets["me_min"], me_req), targets["me_max"])
-
     payload = {
-        "body_weight_kg": body_weight_kg,
-        "milk_yield_kg": milk_yield_kg,
+        "animal": animal,
+        "body_weight_kg": animal["body_weight_kg"],
         "selected_feed_names": selected_feeds,
-        "crude_protein_min": round(cp_target, 2),
-        "crude_protein_max": targets["cp_max"],
-        "metabolic_energy_min": round(me_target, 3),
-        "metabolic_energy_max": targets["me_max"],
-        # % KM -> g/kg KM
-        "calcium_min": round(targets["ca_min"] * 10.0, 2),
-        "calcium_max": round(targets["ca_max"] * 10.0, 2),
-        "phosphorus_min": round(targets["p_min"] * 10.0, 2),
-        "phosphorus_max": round(targets["p_max"] * 10.0, 2),
-        "target_dm_intake_kg": dm_intake_kg,
         "use_all_selected_feeds": use_all_feeds,
         "min_inclusion_pct_dm": min_inclusion_pct_dm,
     }
+    if targets["manual"]:
+        payload.update({
+            "crude_protein_min": targets["cp_min"],
+            "crude_protein_max": targets["cp_max"],
+            "net_energy_lactation_min": targets["nel_min"],
+            "net_energy_lactation_max": targets["nel_max"],
+            # % KM -> g/kg KM
+            "calcium_min": round(targets["ca_min"] * 10.0, 2),
+            "calcium_max": round(targets["ca_max"] * 10.0, 2),
+            "phosphorus_min": round(targets["p_min"] * 10.0, 2),
+            "phosphorus_max": round(targets["p_max"] * 10.0, 2),
+            "target_dm_intake_kg": targets["dm_intake_kg"],
+        })
 
     # Kuru madde aralığı isteğe bağlı. Varsayılan olarak GÖNDERİLMEZ: silajlı bir
     # rasyon asla %85 KM olamaz, sabit bir aralık modeli çözümsüz bırakır.
@@ -292,17 +260,18 @@ def render_results(result: Dict, targets: Dict) -> None:
     checks = [
         ("Ham protein", nutrient_content.get("crude_protein_percent_dm", 0),
          targets["cp_min"], targets["cp_max"], "% KM", 1),
-        ("Met. enerji", nutrient_content.get("metabolic_energy_mcal_per_kg_dm", 0),
-         targets["me_min"], targets["me_max"], "Mcal/kg KM", 2),
+        ("NEL", nutrient_content.get("net_energy_lactation_mcal_per_kg_dm", 0),
+         targets["nel_min"], targets["nel_max"], "Mcal/kg KM", 2),
         ("Kalsiyum", nutrient_content.get("calcium_g_per_kg_dm", 0),
          targets["ca_min"] * 10, targets["ca_max"] * 10, "g/kg KM", 1),
         ("Fosfor", nutrient_content.get("phosphorus_g_per_kg_dm", 0),
          targets["p_min"] * 10, targets["p_max"] * 10, "g/kg KM", 1),
         # Rasyonun yenebilirliğini gösteren iki asıl kontrol: lif ve kaba yem payı.
+        # Pencereler gruba göre değişir (kuru inekte NDF %40-55), backend'den gelir.
         ("NDF", nutrient_content.get("ndf_percent_dm", 0),
-         NDF_TARGET_MIN, NDF_TARGET_MAX, "% KM", 1),
+         targets["ndf_min"], targets["ndf_max"], "% KM", 1),
         ("Kaba yem", nutrient_content.get("forage_ratio_percent", 0),
-         FORAGE_TARGET_MIN, FORAGE_TARGET_MAX, "% KM", 1),
+         targets["forage_min"], targets["forage_max"], "% KM", 1),
     ]
 
     st.markdown("**Besin kontrolü**")
@@ -337,8 +306,7 @@ def render_results(result: Dict, targets: Dict) -> None:
             f"**Ca:P oranı:** {ca_p_ratio:.2f} (hedef 1.5–2.5) &nbsp;|&nbsp; "
             f"**Rasyon kuru maddesi:** {nutrient_content.get('dry_matter_percent', 0):.1f}% "
             "(doğal hali) &nbsp;|&nbsp; "
-            f"**Kaba yem NDF'si:** {nutrient_content.get('forage_ndf_percent_dm', 0):.1f}% KM "
-            "(en az %19)"
+            f"**Kaba yem NDF'si:** {nutrient_content.get('forage_ndf_percent_dm', 0):.1f}% KM"
         )
 
         constraints = result.get("constraints_status") or []
@@ -365,6 +333,8 @@ def render_results(result: Dict, targets: Dict) -> None:
                 pd.DataFrame([
                     {"Besin maddesi": "Ham protein",
                      "Alım": f"{daily_intake.get('crude_protein_kg', 0):.2f} kg/gün"},
+                    {"Besin maddesi": "Net enerji (NEL)",
+                     "Alım": f"{daily_intake.get('net_energy_lactation_mcal') or 0:.1f} Mcal/gün"},
                     {"Besin maddesi": "Metabolik enerji",
                      "Alım": f"{daily_intake.get('metabolic_energy_mcal', 0):.1f} Mcal/gün"},
                     {"Besin maddesi": "Kalsiyum",
@@ -390,57 +360,106 @@ def render_results(result: Dict, targets: Dict) -> None:
 with st.sidebar:
     st.subheader("Hayvan profili")
 
+    group = st.segmented_control(
+        "Hayvan grubu",
+        options=list(GROUP_LABELS),
+        format_func=GROUP_LABELS.get,
+        default="lactating",
+        help="Kuru dönemin rasyon kuralları farklıdır: daha fazla lif ve saman, daha az enerji.",
+    ) or "lactating"
+    lactating = group == "lactating"
+
     body_weight = st.number_input(
-        "Canlı ağırlık (kg)", min_value=200.0, max_value=1000.0, value=600.0, step=25.0
+        "Canlı ağırlık (kg)", min_value=300.0, max_value=1000.0, value=650.0, step=25.0
     )
     milk_yield = st.number_input(
-        "Günlük süt verimi (kg)", min_value=0.0, max_value=60.0, value=30.0, step=1.0
-    )
+        "Günlük süt verimi (kg)", min_value=0.0, max_value=70.0, value=30.0, step=1.0
+    ) if lactating else 0.0
 
-    dm_auto = estimate_dm_intake(body_weight, milk_yield)
-    cp_auto, me_auto = estimate_requirements(body_weight, milk_yield, dm_auto)
+    with st.expander("Hayvan detayları", icon=":material/pets:"):
+        if lactating:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                fat_pct = st.number_input("Süt yağı (%)", 2.0, 6.5, 3.8, 0.1)
+                days_in_milk = st.number_input("Laktasyon günü", 1, 600, 120, 5)
+            with col_b:
+                protein_pct = st.number_input("Süt proteini (%)", 2.4, 4.5, 3.2, 0.1)
+                days_pregnant = st.number_input(
+                    "Gebelik günü", 0, 285, 0, 10, help="0 = gebe değil"
+                )
+        else:
+            fat_pct, protein_pct, days_in_milk = 3.8, 3.2, 120
+            days_pregnant = st.number_input(
+                "Gebelik günü", 150, 285, 230 if group == "dry_faroff" else 265, 5,
+                help="Doğuma ~3 haftadan az kaldıysa 'Kuru (doğuma yakın)' grubunu seç.",
+            )
+        first_lactation = st.toggle(
+            "İlk laktasyon / düve" if lactating else "Düve (ilk doğum)", value=False
+        )
+        bcs = st.slider("Vücut kondisyon skoru (BCS)", 1.0, 5.0, 3.0, 0.25)
 
-    st.metric("Günlük kuru madde ihtiyacı", f"{dm_auto:.1f} kg", border=True)
-    st.caption(
-        f"Hesaplanan hedefler: ham protein %{cp_auto:.1f} KM · "
-        f"enerji {me_auto:.2f} Mcal/kg KM"
-    )
+    animal = {
+        "group": group,
+        "body_weight_kg": body_weight,
+        "milk_kg": milk_yield,
+        "fat_pct": fat_pct,
+        "true_protein_pct": protein_pct,
+        "days_in_milk": int(days_in_milk),
+        "multiparous": not first_lactation,
+        "bcs": bcs,
+        "days_pregnant": int(days_pregnant),
+    }
+    req = fetch_requirements(animal)
+    if req is None:
+        st.stop()
+
+    with st.container(horizontal=True):
+        st.metric("Kuru madde", f"{req['dm_intake_kg']:.1f} kg", border=True)
+        st.metric("NEL", f"{req['nel_min']:.2f}", border=True,
+                  help=f"Mcal/kg KM · günlük ihtiyaç {req['nel_mcal_day']:.1f} Mcal")
+        st.metric("Ham protein", f"%{req['cp_min']:.1f}", border=True,
+                  help=f"% KM · günlük {req['cp_kg_day']:.2f} kg HP ({req['mp_g_day']:.0f} g MP)")
+    st.caption("Hedefler NASEM 2021 denklemleriyle hesaplanır.")
+    for note in req["notes"]:
+        st.caption(f":material/info: {note}")
 
     with st.expander("Gelişmiş ayarlar", icon=":material/tune:"):
         manual_targets = st.toggle(
             "Besin hedeflerini elle ayarla",
             value=False,
-            help="Kapalıyken hedefler canlı ağırlık ve süt veriminden NRC katsayılarıyla "
-                 "otomatik hesaplanır.",
+            help="Kapalıyken hedefler hayvan profilinden NASEM 2021 ile otomatik hesaplanır.",
         )
 
         if manual_targets:
             dm_intake = st.number_input(
                 "Günlük kuru madde tüketimi (kg)",
-                min_value=5.0, max_value=35.0, value=float(round(dm_auto, 1)), step=0.5,
+                min_value=5.0, max_value=35.0, value=float(req["dm_intake_kg"]), step=0.5,
             )
-            cp_req, me_req = estimate_requirements(body_weight, milk_yield, dm_intake)
             col_a, col_b = st.columns(2)
             with col_a:
                 cp_min = st.number_input("Min ham protein (% KM)", 8.0, 30.0,
-                                         float(round(cp_req, 1)), 0.5)
-                me_min = st.number_input("Min enerji (Mcal/kg KM)", 1.5, 4.0,
-                                         float(round(me_req, 2)), 0.05)
-                ca_min = st.number_input("Min kalsiyum (% KM)", 0.2, 2.0, DEFAULT_CA_MIN, 0.05)
-                p_min = st.number_input("Min fosfor (% KM)", 0.1, 1.5, DEFAULT_P_MIN, 0.05)
+                                         float(round(req["cp_min"], 1)), 0.5)
+                nel_min = st.number_input("Min NEL (Mcal/kg KM)", 0.9, 2.0,
+                                          float(round(req["nel_min"], 2)), 0.02)
+                ca_min = st.number_input("Min kalsiyum (% KM)", 0.2, 2.0,
+                                         req["calcium_min"] / 10, 0.05)
+                p_min = st.number_input("Min fosfor (% KM)", 0.1, 1.5,
+                                        req["phosphorus_min"] / 10, 0.05)
             with col_b:
                 cp_max = st.number_input("Max ham protein (% KM)", 10.0, 35.0,
-                                         float(round(cp_req + CP_BAND, 1)), 0.5)
-                me_max = st.number_input("Max enerji (Mcal/kg KM)", 2.0, 5.0,
-                                         float(round(me_req + ME_BAND, 2)), 0.05)
-                ca_max = st.number_input("Max kalsiyum (% KM)", 0.3, 3.0, DEFAULT_CA_MAX, 0.05)
-                p_max = st.number_input("Max fosfor (% KM)", 0.2, 2.0, DEFAULT_P_MAX, 0.05)
+                                         float(round(req["cp_max"], 1)), 0.5)
+                nel_max = st.number_input("Max NEL (Mcal/kg KM)", 1.0, 2.5,
+                                          float(round(req["nel_max"], 2)), 0.02)
+                ca_max = st.number_input("Max kalsiyum (% KM)", 0.3, 3.0,
+                                         req["calcium_max"] / 10, 0.05)
+                p_max = st.number_input("Max fosfor (% KM)", 0.2, 2.0,
+                                        req["phosphorus_max"] / 10, 0.05)
         else:
-            dm_intake = dm_auto
-            cp_min, cp_max = cp_auto, cp_auto + CP_BAND
-            me_min, me_max = me_auto, me_auto + ME_BAND
-            ca_min, ca_max = DEFAULT_CA_MIN, DEFAULT_CA_MAX
-            p_min, p_max = DEFAULT_P_MIN, DEFAULT_P_MAX
+            dm_intake = req["dm_intake_kg"]
+            cp_min, cp_max = req["cp_min"], req["cp_max"]
+            nel_min, nel_max = req["nel_min"], req["nel_max"]
+            ca_min, ca_max = req["calcium_min"] / 10, req["calcium_max"] / 10
+            p_min, p_max = req["phosphorus_min"] / 10, req["phosphorus_max"] / 10
 
         ratio = ca_min / p_min if p_min > 0 else 0
         st.caption(f"Hedeflenen Ca:P oranı {ratio:.2f} (önerilen 1.5–2.5)")
@@ -493,11 +512,15 @@ with st.sidebar:
         st.caption(sync_message)
 
 targets = {
+    "manual": manual_targets,
     "dm_intake_kg": dm_intake,
     "cp_min": cp_min, "cp_max": cp_max,
-    "me_min": me_min, "me_max": me_max,
+    "nel_min": nel_min, "nel_max": nel_max,
     "ca_min": ca_min, "ca_max": ca_max,
     "p_min": p_min, "p_max": p_max,
+    # Grubun rasyon kuralları — sonuç kartları bunlara göre "hedefte" der.
+    "ndf_min": req["ndf_min"], "ndf_max": req["ndf_max"],
+    "forage_min": req["forage_ratio_min"], "forage_max": req["forage_ratio_max"],
 }
 
 
@@ -531,8 +554,8 @@ with col_forage:
         "Kaba yemler",
         options=forage_options,
         placeholder="Silaj, kuru ot, saman…",
-        help="Rasyonun %45-65'i kaba yemden gelir. Silaj seçilirse kaba yemin tabanını "
-             "silaj oluşturur.",
+        help=f"Bu grupta rasyonun %{targets['forage_min']:.0f}-{targets['forage_max']:.0f}'i "
+             "kaba yemden gelir.",
     )
 with col_concentrate:
     selected_concentrates = st.multiselect(
@@ -552,7 +575,8 @@ selected_feeds = selected_forages + selected_concentrates + selected_minerals
 
 if selected_feeds and not selected_forages:
     st.warning(
-        "Hiç kaba yem seçmedin. Rumen sağlığı için rasyonun en az %45'i kaba yem olmalı.",
+        f"Hiç kaba yem seçmedin. Rumen sağlığı için rasyonun en az "
+        f"%{targets['forage_min']:.0f}'i kaba yem olmalı.",
         icon=":material/warning:",
     )
 
@@ -573,7 +597,7 @@ if selected_feeds:
             "Kaynak": feeds_by_name[name].get("price_source") or "taban fiyat",
             "Max kg/gün": _health_cap(feeds_by_name[name]),
             "HP (%)": round(feeds_by_name[name].get("crude_protein", 0) or 0, 1),
-            "ME (Mcal/kg)": round(feeds_by_name[name].get("metabolic_energy", 0) or 0, 2),
+            "NEL (Mcal/kg)": round(feeds_by_name[name].get("net_energy_lactation", 0) or 0, 2),
         }
         for name in selected_feeds
     ])
@@ -597,9 +621,9 @@ if selected_feeds:
                      "miktar. Boş ise as-fed sınırı yok. Bu sınır hiçbir koşulda aşılmaz.",
             ),
             "HP (%)": st.column_config.NumberColumn(format="%.1f"),
-            "ME (Mcal/kg)": st.column_config.NumberColumn(format="%.2f"),
+            "NEL (Mcal/kg)": st.column_config.NumberColumn(format="%.2f"),
         },
-        disabled=["Yem", "Kaynak", "Max kg/gün", "HP (%)", "ME (Mcal/kg)"],
+        disabled=["Yem", "Kaynak", "Max kg/gün", "HP (%)", "NEL (Mcal/kg)"],
         hide_index=True,
         num_rows="fixed",
         width="stretch",
@@ -623,8 +647,7 @@ if calculate:
     with st.spinner("Rasyon optimize ediliyor..."):
         payload = build_optimization_payload(
             selected_feeds=selected_feeds,
-            body_weight_kg=body_weight,
-            milk_yield_kg=milk_yield,
+            animal=animal,
             targets=targets,
             use_all_feeds=use_all_feeds,
             min_inclusion_pct_dm=min_inclusion_pct,
@@ -642,4 +665,4 @@ if calculate:
 if "last_result" in st.session_state:
     render_results(st.session_state["last_result"], st.session_state["last_targets"])
 
-st.caption("RationAI · FastAPI + PuLP · Yem verileri: INRA 2004 tabloları")
+st.caption("RationAI · FastAPI + PuLP · İhtiyaçlar: NASEM 2021 · Yem verileri: INRA 2004 tabloları")

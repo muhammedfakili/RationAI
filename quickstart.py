@@ -1,125 +1,74 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-RationAI Quick Start - Cross-platform Python launcher
-Run: python quickstart.py
+"""RationAI quick start (no Docker): seed DB -> index docs -> backend + frontend.
+
+Run: .venv/Scripts/python.exe quickstart.py   (Ctrl+C stops both servers)
 """
 
-import os
-import sys
+import shutil
 import subprocess
+import sys
 import time
+import urllib.request
 from pathlib import Path
 
+BASE_DIR = Path(__file__).parent
+HEALTH_URL = "http://localhost:8000/api/v1/health"
 
-def find_python():
-    """Find the virtual environment Python executable."""
-    base = Path(__file__).parent
-    # Windows
-    win_python = base / ".venv" / "Scripts" / "python.exe"
-    if win_python.exists():
-        return str(win_python)
-    # Unix/Linux/macOS
-    unix_python = base / ".venv" / "bin" / "python"
-    if unix_python.exists():
-        return str(unix_python)
+
+def find_python() -> str | None:
+    for candidate in (BASE_DIR / ".venv" / "Scripts" / "python.exe", BASE_DIR / ".venv" / "bin" / "python"):
+        if candidate.exists():
+            return str(candidate)
     return None
 
 
-def run_cmd(cmd, cwd=None, description="", check=True, capture=False):
-    """Run a command and return result."""
-    print(f"  $ {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-    try:
-        if capture:
-            result = subprocess.run(
-                cmd, cwd=cwd, shell=isinstance(cmd, str),
-                capture_output=True, text=True, check=check
-            )
-            if result.stdout:
-                print(f"     {result.stdout.strip()}")
-            return result
-        else:
-            subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), check=check)
-    except subprocess.CalledProcessError as e:
-        print(f"  [ERROR] {description or 'Command failed'}: {e}")
-        if check:
-            raise
-    return None
+def wait_for_backend(timeout_s: float = 60.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(HEALTH_URL, timeout=2):
+                return True
+        except OSError:
+            time.sleep(1)
+    return False
 
 
-def main():
-    base_dir = Path(__file__).parent
-    os.chdir(base_dir)
-
-    print("\n" + "=" * 60)
-    print("  RATIONAI QUICK START")
-    print("=" * 60 + "\n")
-
-    # Find Python
+def main() -> int:
     python = find_python()
     if not python:
-        print("[ERROR] Virtual environment not found at .venv/")
-        print("  Create it: python -m venv .venv")
-        print("  Install deps: .venv/Scripts/pip install -r requirements.txt")
-        print("  (Or skip all of this and run: docker compose up)")
+        print("[HATA] .venv bulunamadı. Kurulum:\n"
+              "  python -m venv .venv\n"
+              "  .venv/Scripts/pip install -r requirements.txt\n"
+              "  (ya da hiç uğraşmadan: docker compose up)")
         return 1
-    print(f"[OK] Using Python: {python}")
 
-    # Check .env
-    env_file = base_dir / ".env"
+    env_file = BASE_DIR / ".env"
     if not env_file.exists():
-        print("[WARNING] .env not found - creating template")
-        env_file.write_text("DATABASE_URL=sqlite:///rationai.db\nGROQ_API_KEY=your_groq_api_key_here\n")
-        print("  Please edit .env and add your GROQ_API_KEY from https://console.groq.com")
-        input("  Press Enter after editing .env...")
+        shutil.copy(BASE_DIR / ".env.example", env_file)
+        print("[BİLGİ] .env, .env.example'dan oluşturuldu. Sohbet için GROQ_API_KEY ekleyebilirsin (opsiyonel).")
 
-    # Step 1: Database setup
-    print("\n[1/4] Setting up database and seeding 37 feed ingredients...")
-    run_cmd([python, "-m", "backend.app.database"], description="Database setup")
+    print("[1/3] Veritabanı hazırlanıyor...")
+    subprocess.run([python, "-m", "backend.app.database"], cwd=BASE_DIR, check=True)
 
-    # Step 2: RAG ingestion
-    print("\n[2/4] Ingesting RAG documents into ChromaDB...")
-    run_cmd(
-        [python, "-m", "backend.app.rag"],  # Run as module to properly import
-        description="RAG ingestion", check=False
+    print("[2/3] Bilgi tabanı kontrol ediliyor...")
+    subprocess.run([python, "-m", "backend.app.rag", "--if-empty"], cwd=BASE_DIR, check=False)
+
+    print("[3/3] Sunucular başlatılıyor — arayüz: http://localhost:8501 · API: http://localhost:8000/docs")
+    backend = subprocess.Popen(
+        [python, "-m", "uvicorn", "backend.app.main:app", "--reload", "--port", "8000"], cwd=BASE_DIR
     )
-
-    # Step 3 & 4: Start servers
-    print("\n[3/4] Starting FastAPI backend on http://localhost:8000")
-    print("      API docs: http://localhost:8000/docs")
-
-    print("\n[4/4] Starting Streamlit frontend on http://localhost:8501")
-
-    print("\n" + "=" * 60)
-    print("  PRESS CTRL+C TO STOP BOTH SERVERS")
-    print("=" * 60 + "\n")
-
-    # Start backend
-    backend_proc = subprocess.Popen(
-        [python, "-m", "uvicorn", "backend.app.main:app", "--reload", "--port", "8000"],
-        cwd=base_dir
-    )
-
-    # Wait for backend
-    time.sleep(3)
-
     try:
-        # Start frontend (blocking)
-        frontend_proc = subprocess.Popen(
-            [python, "-m", "streamlit", "run", "frontend/app.py"],
-            cwd=base_dir
-        )
-        frontend_proc.wait()
+        if not wait_for_backend():
+            print("[UYARI] Backend 60 sn içinde yanıt vermedi; arayüz yine de açılıyor.")
+        subprocess.run([python, "-m", "streamlit", "run", "frontend/app.py"], cwd=BASE_DIR)
     except KeyboardInterrupt:
-        print("\n\nShutting down...")
+        pass
     finally:
-        backend_proc.terminate()
+        backend.terminate()
         try:
-            backend_proc.wait(timeout=5)
+            backend.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            backend_proc.kill()
-
-    print("Done.")
+            backend.kill()
     return 0
 
 

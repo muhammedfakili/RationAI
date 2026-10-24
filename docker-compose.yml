@@ -28,6 +28,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-rationai}:${POSTGRES_PASSWORD:-rationai}@db:5432/${POSTGRES_DB:-rationai}
       # Boş bırakılabilir: sohbet kapanır, gerisi çalışır.
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       db:

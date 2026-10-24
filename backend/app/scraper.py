@@ -30,7 +30,6 @@ from .models import Feed
 logger = logging.getLogger(__name__)
 
 TOBB_BASE_URL = "https://borsa.tobb.org.tr/fiyat_borsa.php"
-TOBB_INDEX_URL = "https://borsa.tobb.org.tr/fiyat_borsa0.php"
 
 # Tahıl işlemi yoğun borsalar. Liste `fiyat_borsa0.php`'den genişletilebilir;
 # bayat veri tazelik filtresiyle zaten elenir.
@@ -89,7 +88,6 @@ class FeedPrice:
     source: str                  # "Bandırma TB (+3 borsa)"
     date: str                    # ISO tarih
     sample_count: int = 1
-    unit: str = "TL/kg"
 
 
 def _parse_turkish_number(text: str) -> List[float]:
@@ -266,12 +264,11 @@ def update_feed_prices(
         price_updates: Verilirse canlı çekim yapılmaz, bu fiyatlar elle uygulanır.
 
     Returns:
-        {"updated": [Feed], "live_count": int, "source": str, "details": {ad: kaynak}}
+        {"updated": [Feed], "live_count": int, "baseline_count": int, "source": str}
         Canlı kaynak bulunamazsa fiyatlara DOKUNULMAZ ve live_count 0 döner —
         eskiden burada sessizce rastgele bir simülasyon çalışıyordu.
     """
     now = datetime.now()
-    details: Dict[str, str] = {}
     updated: List[Feed] = []
 
     if price_updates is not None:
@@ -296,7 +293,6 @@ def update_feed_prices(
         feed.price_source = source
         feed.price_updated_at = stamp
         updated.append(feed)
-        details[feed_name] = source
 
     if updated:
         db.commit()
@@ -307,25 +303,11 @@ def update_feed_prices(
         "live_count": len(updated),
         "baseline_count": max(total_feeds - len(updated), 0),
         "source": source_label,
-        "details": details,
     }
-
-
-def get_current_market_prices(db: Session) -> Dict[str, float]:
-    """Veritabanındaki güncel fiyatlar; tablo boşsa küratörlü taban fiyatlar."""
-    feeds = db.query(Feed).all()
-    if feeds:
-        return {f.name: f.price_per_kg for f in feeds}
-    return _curated_base_prices()
-
-
-def fetch_live_prices_only() -> Dict[str, FeedPrice]:
-    """Veritabanına yazmadan canlı fiyatları çeker (teşhis/test için)."""
-    return TurkishFeedPriceScraper(base_prices=_curated_base_prices()).scrape_all()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    for name, fp in sorted(fetch_live_prices_only().items()):
+    for name, fp in sorted(TurkishFeedPriceScraper(base_prices=_curated_base_prices()).scrape_all().items()):
         print(f"{name:<12} {fp.price_per_kg:>7.2f} TL/kg  {fp.source} · {fp.date} "
               f"({fp.sample_count} kayıt)")
