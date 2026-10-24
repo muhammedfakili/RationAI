@@ -201,6 +201,7 @@ MIN_INCLUSION_BY_TYPE = {
 NDF_INTAKE_PCT_BW = 1.2                        # kg NDF/gün <= %1.2 x canlı ağırlık
 CA_P_RATIO_MIN, CA_P_RATIO_MAX = 1.5, 2.5
 MIN_DAILY_DM_INTAKE_KG = 12.0                  # hedef verilmezse önemsiz çözümleri engeller
+SALT_MIN_PCT_DM = 0.25                         # seçiliyse tuz en az bu kadar (% KM)
 
 # Protein korumalı koridor: bu yemlerden biri seçiliyse HP < %12 KM ağır cezalandırılır.
 PROTEIN_GUARDRAIL_PCT = 12.0
@@ -209,7 +210,6 @@ PROTEIN_RICH_FEEDS = frozenset({
 })
 
 # Ceza çarpanları (soft_constraint_penalty'nin katları).
-PENALTY_MIN_INCLUSION = 3.0
 PENALTY_MAX_INCLUSION = 5.0
 PENALTY_FORCED_INCLUSION = 30.0   # "seçtiğim yemi kullan" ekonomik tercihlerin çok önünde
 PENALTY_CA_P_RATIO = 2.0
@@ -404,13 +404,19 @@ def solve_ration_problem(
             )
 
     windowed: Dict[str, List[str]] = {}
+    # KM için büyük-M: doğal hali tüketim tavanı KM'yi de sınırlar.
+    big_m = max_daily_intake_kg or 50.0
     for feed in feeds:
         min_frac = MIN_INCLUSION_BY_TYPE.get(feed.feed_type, 0.01)
-        # Zorunlu dahil açıkken ayrıca yumuşak minimum kurulmaz (çift ceza olurdu).
+        # Zorunlu dahil kapalıyken minimum "ya hiç ya en az" kuralıdır (yarı sürekli).
+        # ⚠️ Eskiden yumuşak bir alt sınırdı: her yemi rasyona sokmanın bir cezası vardı,
+        # "en ucuz kombinasyon" isteyene 28-33 yemlik rasyon çıkıyordu.
+        # Zorunlu dahil açıkken kurulmaz (o zaman her yem zaten zorunlu).
         if min_frac > 0 and not force_use_all_feeds:
-            slack = soft(f"min_incl_slack_{feed.name}", PENALTY_MIN_INCLUSION)
-            prob += (feed.dm_fraction() * x[feed.name] >= min_frac * total_dm - slack,
-                     f"Min_Inclusion_{feed.name}")
+            used = pulp.LpVariable(f"used_{feed.name}", cat="Binary")
+            dm_i = feed.dm_fraction() * x[feed.name]
+            prob += dm_i >= min_frac * total_dm - big_m * (1 - used), f"Min_Inclusion_{feed.name}"
+            prob += dm_i <= big_m * used, f"Used_{feed.name}"
             windowed.setdefault(feed.feed_type, []).append(feed.name)
 
         max_slack = 0 if hard_ration_rules else soft(f"max_incl_slack_{feed.name}", PENALTY_MAX_INCLUSION)
@@ -424,7 +430,10 @@ def solve_ration_problem(
             for ftype, names in windowed.items()
         ]
         mode = "KATI" if hard_ration_rules else "yumuşak"
-        adjustments.append(f"🔒 Yem sınıfı dahil pencereleri ({mode}): {'; '.join(parts)}")
+        adjustments.append(
+            f"🔒 Yem sınıfı dahil pencereleri ({mode}; kullanılan yem en az alt sınır kadar "
+            f"girer): {'; '.join(parts)}"
+        )
 
     # ---- Besin hedefleri (HP, ME, Ca, P) ----
     # hard_nutrients=True iken slack yok -> hedefler GARANTİ edilir (model infeasible olabilir).
@@ -517,6 +526,14 @@ def solve_ration_problem(
                      "Hay_Aggregate_Max")
     else:
         adjustments.append("⚠️ UYARI: Rasyonda hiç kaba yem yok! Rumen sağlığı için silaj/kuru ot ekleyin.")
+
+    # Tuzun modelde besin karşılığı yok (Na izlenmiyor): kural olmasa en ucuz rasyon
+    # tuzu her zaman düşürürdü.
+    salt_feeds = [f for f in feeds if f.feed_type == "salt"]
+    if salt_feeds:
+        prob += (dm_sum(salt_feeds) >= SALT_MIN_PCT_DM / 100.0 * total_dm - rule_slack("salt_min"),
+                 "Salt_Min")
+        adjustments.append(f"🧂 Tuz en az %{SALT_MIN_PCT_DM} KM.")
 
     # ==================== AMAÇ FONKSİYONU (EN SONDA, TEK SEFERDE) ====================
     prob += feed_cost + pulp.lpSum(penalties), "Total_Cost"
