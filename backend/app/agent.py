@@ -164,7 +164,8 @@ def get_feed_data() -> ToolResult:
         return "Veritabanında yem verisi yok.", None
     lines = ["Mevcut yemler (besin değerleri KM bazında):"] + [
         f"- {f.name} [{f.feed_type}]: {f.price_per_kg} TL/kg, KM %{f.dry_matter}, "
-        f"HP %{f.crude_protein}, NEL {f.net_energy_lactation} Mcal/kg, "
+        f"HP %{f.crude_protein} (RUP %{f.rup or 0:.0f}'i), NEL {f.net_energy_lactation} Mcal/kg, "
+        f"nişasta %{f.starch or 0:.0f}, yağ %{f.ether_extract or 0:.1f}, "
         f"ME {f.metabolic_energy} Mcal/kg, NDF %{f.ndf}, "
         f"Ca {f.calcium} g/kg, P {f.phosphorus} g/kg"
         for f in feeds
@@ -237,7 +238,7 @@ def calculate_ration(
         + (f", {profile.milk_kg:.0f} kg süt, laktasyonun {profile.days_in_milk}. günü"
            if group == "lactating" else "")
         + f": KMT {req.dm_intake_kg} kg, NEL {req.nel_min}-{req.nel_max} Mcal/kg KM, "
-          f"HP %{target.crude_protein_min}-{target.crude_protein_max} (NASEM 2021)."
+          f"MP {req.mp_g_day:.0f} g/gün (NASEM 2021)."
     ] + [f"ℹ️ {note}" for note in req.notes] + result.adjustments
     structured = optimization_result_to_schema(result, feed_inputs).model_dump()
     return format_result_for_agent(result), structured

@@ -23,3 +23,6 @@ class Feed(Base):
     ndf = Column(Float)  # Neutral Detergent Fiber % DM (NRC 2001)
     calcium = Column(Float)
     phosphorus = Column(Float)
+    starch = Column(Float, nullable=True)         # % KM — asidoz sınırı
+    ether_extract = Column(Float, nullable=True)  # ham yağ, % KM
+    rup = Column(Float, nullable=True)            # by-pass protein, HAM PROTEİNİN %'si

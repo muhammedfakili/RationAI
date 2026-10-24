@@ -129,7 +129,8 @@ def build_optimization_payload(
     }
     if targets["manual"]:
         payload.update({
-            "crude_protein_min": targets["cp_min"],
+            # HP alt sınırı gönderilmez: kuru dönem tabanını backend profilden doldurur.
+            "metabolizable_protein_min": targets["mp_min"],
             "crude_protein_max": targets["cp_max"],
             "net_energy_lactation_min": targets["nel_min"],
             "net_energy_lactation_max": targets["nel_max"],
@@ -257,9 +258,11 @@ def render_results(result: Dict, targets: Dict) -> None:
 
     # --- Besin kontrolü ---
     # ⚠️ Arayüz Ca/P'yi % KM tutar, sonuç g/kg KM gelir -> karşılaştırmada x10.
+    # Sınırı olmayan tarafta None: MP'nin üst, nişastanın alt sınırı yok.
     checks = [
-        ("Ham protein", nutrient_content.get("crude_protein_percent_dm", 0),
-         targets["cp_min"], targets["cp_max"], "% KM", 1),
+        # Protein MP olarak hedeflenir (mikrobiyal + by-pass protein), g/gün gösterilir.
+        ("MP (g/gün)", daily_intake.get("mp_g") or 0,
+         targets["mp_min"] * targets["dm_intake_kg"], None, "g/gün", 0),
         ("NEL", nutrient_content.get("net_energy_lactation_mcal_per_kg_dm", 0),
          targets["nel_min"], targets["nel_max"], "Mcal/kg KM", 2),
         ("Kalsiyum", nutrient_content.get("calcium_g_per_kg_dm", 0),
@@ -272,18 +275,26 @@ def render_results(result: Dict, targets: Dict) -> None:
          targets["ndf_min"], targets["ndf_max"], "% KM", 1),
         ("Kaba yem", nutrient_content.get("forage_ratio_percent", 0),
          targets["forage_min"], targets["forage_max"], "% KM", 1),
+        # NDF lifi söyler ama asidozu yakalamaz; nişasta tavanı onu tutar.
+        ("Nişasta", nutrient_content.get("starch_percent_dm") or 0,
+         None, targets["starch_max"], "% KM", 1),
     ]
 
     st.markdown("**Besin kontrolü**")
     with st.container(horizontal=True):
         for label, value, low, high, unit, digits in checks:
+            if high is None:
+                target_text = f"en az {low:.{digits}f} {unit}"
+            elif low is None:
+                target_text = f"en fazla {high:.{digits}f} {unit}"
+            else:
+                target_text = f"{low:.{digits}f}–{high:.{digits}f} {unit}"
+            # Gösterilen değer yuvarlandığı için kıyas da 0.5 hane toleranslı.
+            tol = 0.5 * 10 ** -digits
+            in_range = (low is None or value >= low - tol) and (high is None or value <= high + tol)
             with st.container(border=True):
-                st.metric(
-                    label,
-                    f"{value:.{digits}f}",
-                    help=f"Hedef aralığı: {low:.{digits}f}–{high:.{digits}f} {unit}",
-                )
-                if low <= value <= high:
+                st.metric(label, f"{value:.{digits}f}", help=f"Hedef: {target_text}")
+                if in_range:
                     st.badge("Hedefte", icon=":material/check:", color="green")
                 else:
                     st.badge("Aralık dışı", icon=":material/priority_high:", color="orange")
@@ -308,6 +319,14 @@ def render_results(result: Dict, targets: Dict) -> None:
             "(doğal hali) &nbsp;|&nbsp; "
             f"**Kaba yem NDF'si:** {nutrient_content.get('forage_ndf_percent_dm', 0):.1f}% KM"
         )
+        st.markdown(
+            f"**Ham protein:** %{nutrient_content.get('crude_protein_percent_dm', 0):.1f} KM "
+            f"(RDP %{nutrient_content.get('rdp_percent_dm') or 0:.1f}, "
+            f"RUP %{nutrient_content.get('rup_percent_dm') or 0:.1f}) &nbsp;|&nbsp; "
+            f"**RDP dengesi:** {nutrient_content.get('rdp_balance_g') or 0:+.0f} g/gün &nbsp;|&nbsp; "
+            f"**Ham yağ:** %{nutrient_content.get('ether_extract_percent_dm') or 0:.1f} KM "
+            f"(en fazla %{targets['fat_max']:.0f})"
+        )
 
         constraints = result.get("constraints_status") or []
         if constraints:
@@ -331,6 +350,8 @@ def render_results(result: Dict, targets: Dict) -> None:
             st.markdown("**Günlük besin maddesi alımı**")
             st.dataframe(
                 pd.DataFrame([
+                    {"Besin maddesi": "Metabolize protein (MP)",
+                     "Alım": f"{daily_intake.get('mp_g') or 0:.0f} g/gün"},
                     {"Besin maddesi": "Ham protein",
                      "Alım": f"{daily_intake.get('crude_protein_kg', 0):.2f} kg/gün"},
                     {"Besin maddesi": "Net enerji (NEL)",
@@ -417,8 +438,8 @@ with st.sidebar:
         st.metric("Kuru madde", f"{req['dm_intake_kg']:.1f} kg", border=True)
         st.metric("NEL", f"{req['nel_min']:.2f}", border=True,
                   help=f"Mcal/kg KM · günlük ihtiyaç {req['nel_mcal_day']:.1f} Mcal")
-        st.metric("Ham protein", f"%{req['cp_min']:.1f}", border=True,
-                  help=f"% KM · günlük {req['cp_kg_day']:.2f} kg HP ({req['mp_g_day']:.0f} g MP)")
+        st.metric("MP", f"{req['mp_g_day']:.0f} g", border=True,
+                  help=f"Metabolize protein ihtiyacı, günlük · hedef {req['mp_min']:.0f} g/kg KM")
     st.caption("Hedefler NASEM 2021 denklemleriyle hesaplanır.")
     for note in req["notes"]:
         st.caption(f":material/info: {note}")
@@ -437,8 +458,8 @@ with st.sidebar:
             )
             col_a, col_b = st.columns(2)
             with col_a:
-                cp_min = st.number_input("Min ham protein (% KM)", 8.0, 30.0,
-                                         float(round(req["cp_min"], 1)), 0.5)
+                mp_min = st.number_input("Min MP (g/kg KM)", 40.0, 160.0,
+                                         float(round(req["mp_min"])), 1.0)
                 nel_min = st.number_input("Min NEL (Mcal/kg KM)", 0.9, 2.0,
                                           float(round(req["nel_min"], 2)), 0.02)
                 ca_min = st.number_input("Min kalsiyum (% KM)", 0.2, 2.0,
@@ -456,7 +477,7 @@ with st.sidebar:
                                         req["phosphorus_max"] / 10, 0.05)
         else:
             dm_intake = req["dm_intake_kg"]
-            cp_min, cp_max = req["cp_min"], req["cp_max"]
+            mp_min, cp_max = req["mp_min"], req["cp_max"]
             nel_min, nel_max = req["nel_min"], req["nel_max"]
             ca_min, ca_max = req["calcium_min"] / 10, req["calcium_max"] / 10
             p_min, p_max = req["phosphorus_min"] / 10, req["phosphorus_max"] / 10
@@ -514,7 +535,8 @@ with st.sidebar:
 targets = {
     "manual": manual_targets,
     "dm_intake_kg": dm_intake,
-    "cp_min": cp_min, "cp_max": cp_max,
+    "mp_min": mp_min, "cp_max": cp_max,
+    "starch_max": req["starch_max"], "fat_max": req["fat_max"],
     "nel_min": nel_min, "nel_max": nel_max,
     "ca_min": ca_min, "ca_max": ca_max,
     "p_min": p_min, "p_max": p_max,

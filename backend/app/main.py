@@ -149,6 +149,7 @@ def requirements(animal: AnimalProfileIn):
         nel_min=req.nel_min,
         nel_max=req.nel_max,
         mp_g_day=req.mp_g_day,
+        mp_min=req.mp_min,
         cp_kg_day=req.cp_kg_day,
         cp_min=req.cp_min,
         cp_max=req.cp_max,
@@ -162,6 +163,8 @@ def requirements(animal: AnimalProfileIn):
         ndf_max=rules.ndf_max,
         forage_ratio_min=rules.forage_ratio_min * 100,
         forage_ratio_max=rules.forage_ratio_max * 100,
+        starch_max=rules.starch_max,
+        fat_max=rules.fat_max,
     )
 
 
@@ -201,6 +204,7 @@ def optimize(request: OptimizationRequest, db: Session = Depends(get_db)):
         metabolic_energy_max=request.metabolic_energy_max,
         net_energy_lactation_min=request.net_energy_lactation_min,
         net_energy_lactation_max=request.net_energy_lactation_max,
+        metabolizable_protein_min=request.metabolizable_protein_min,
         calcium_min=request.calcium_min,
         calcium_max=request.calcium_max,
         phosphorus_min=request.phosphorus_min,

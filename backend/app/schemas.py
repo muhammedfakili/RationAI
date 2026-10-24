@@ -29,8 +29,9 @@ class RequirementsResponse(BaseModel):
     nel_min: float = Field(..., description="Mcal NEL/kg DM")
     nel_max: float
     mp_g_day: float
+    mp_min: float = Field(..., description="g metabolizable protein / kg DM")
     cp_kg_day: float
-    cp_min: float = Field(..., description="% DM")
+    cp_min: Optional[float] = Field(None, description="% DM — dry-cow floor only")
     cp_max: float
     calcium_min: float = Field(..., description="g/kg DM (= % x 10)")
     calcium_max: float
@@ -43,6 +44,8 @@ class RequirementsResponse(BaseModel):
     ndf_max: float
     forage_ratio_min: float = Field(..., description="% of DM")
     forage_ratio_max: float
+    starch_max: float = Field(..., description="% DM")
+    fat_max: float = Field(..., description="Crude fat (EE) % DM")
 
 
 class FeedResponse(BaseModel):
@@ -64,6 +67,9 @@ class FeedResponse(BaseModel):
     ndf: float = Field(..., ge=0, le=100, description="Neutral detergent fiber % DM (NRC 2001)")
     calcium: float = Field(..., ge=0, description="Calcium g/kg DM")
     phosphorus: float = Field(..., ge=0, description="Phosphorus g/kg DM")
+    starch: Optional[float] = Field(None, ge=0, le=100, description="Starch % DM")
+    ether_extract: Optional[float] = Field(None, ge=0, le=100, description="Crude fat (EE) % DM")
+    rup: Optional[float] = Field(None, ge=0, le=100, description="Rumen-undegradable protein, % of CP")
     max_kg_per_day: Optional[float] = Field(
         None, ge=0,
         description="Animal-health ceiling: max kg as-fed per day for a 600 kg cow "
@@ -92,6 +98,9 @@ class OptimizationRequest(BaseModel):
     metabolic_energy_max: Optional[float] = Field(None, ge=0, le=5, description="Max ME Mcal/kg DM")
     net_energy_lactation_min: Optional[float] = Field(None, ge=0, le=3, description="Min NEL Mcal/kg DM")
     net_energy_lactation_max: Optional[float] = Field(None, ge=0, le=3, description="Max NEL Mcal/kg DM")
+    metabolizable_protein_min: Optional[float] = Field(
+        None, ge=0, le=200, description="Min metabolizable protein, g/kg DM (NRC 2001 MP supply)"
+    )
 
     # ⚠️ BIRIM: Ca ve P g/kg KM cinsindendir - yüzdenin 10 KATI.
     # Örn. rasyonda %0.6 Ca hedefliyorsan buraya 6.0 gönder.
@@ -136,6 +145,12 @@ class NutrientContent(BaseModel):
     metabolic_energy_mcal_per_kg_af: Optional[float] = None
     calcium_g_per_kg_af: Optional[float] = None
     phosphorus_g_per_kg_af: Optional[float] = None
+    starch_percent_dm: Optional[float] = None
+    ether_extract_percent_dm: Optional[float] = None
+    rdp_percent_dm: Optional[float] = None
+    rup_percent_dm: Optional[float] = None
+    mp_g_per_kg_dm: Optional[float] = Field(None, description="Metabolizable protein supply, g/kg DM")
+    rdp_balance_g: Optional[float] = Field(None, description="RDP minus what rumen microbes need, g/day")
 
 
 class DailyNutrientIntake(BaseModel):
@@ -147,6 +162,7 @@ class DailyNutrientIntake(BaseModel):
     phosphorus_g: float
     net_energy_lactation_mcal: Optional[float] = None
     ndf_kg: Optional[float] = None
+    mp_g: Optional[float] = Field(None, description="Metabolizable protein supply, g/day")
 
 
 class FeedRecommendation(BaseModel):
