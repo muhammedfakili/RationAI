@@ -12,14 +12,14 @@ Kaynaklar:
 - NEL idame: 0.10·CA^0.75.
 - Gebelik NEL/MP: NASEM 2021 tablosu (gün 50–275), CA ile oranlanır.
 
-⚠️ Protein YAKLAŞIKTIR: yem tablosunda RDP/RUP olmadığı için MP ihtiyacı sabit bir
-MP:HP oranıyla (0.64) ham proteine çevrilir. Gerçek MP sistemi yem verisi
-genişleyince (RDP/RUP) gelecek.
+Protein METABOLİZE PROTEİN (MP) olarak hedeflenir: solver yemlerin RDP/RUP'undan
+mikrobiyal protein + by-pass protein arzını hesaplar (optimization.py, NRC 2001).
+Ham protein yalnızca üst sınır (azot israfı) ve kuru dönem tabanı olarak kalır.
 """
 
 import math
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from .optimization import RULES_BY_GROUP, NutrientConstraints
 
@@ -28,7 +28,7 @@ GESTATION_LENGTH_D = 280
 DEFAULT_DAYS_PREGNANT = {"dry_faroff": 230, "dry_closeup": 265}
 
 NEL_MAINTENANCE_PER_MBW = 0.10     # Mcal NEL / kg CA^0.75
-MP_TO_CP = 0.64                    # MP:HP vekil oranı (RDP/RUP gelene kadar)
+MP_TO_CP = 0.64                    # MP:HP oranı — yalnızca HP üst sınırını kurmak için
 MP_MILK_EFFICIENCY = 0.69          # NASEM hedef verimi (süt gerçek proteini)
 MFP_G_PER_KG_DMI = 30.0            # metabolik dışkı proteini (NRC 2001 üst yaklaşımı)
 HEIFER_DRY_DMI_FACTOR = 0.88
@@ -48,7 +48,10 @@ _GESTATION_REFERENCE_BW = 700.0
 # katı modda ulaşabildiği en yüksek NEL (sağmal 1.71, close-up 1.56, far-off 1.46).
 # Tavana çok yakın hedefte enerjisiz yemler enerjiyi seyrelttiği için tuz rasyondan düşüyordu.
 NEL_DENSITY_CAP = {"lactating": 1.70, "dry_faroff": 1.45, "dry_closeup": 1.55}
-# Aynı sebeple protein: taze inekte KMT düşükken HP yoğunluğu %20'yi aşar.
+# Aynı sebeple MP (g MP / kg KM): ölçülen tavan sağmal 114, close-up 98, far-off 88.
+# Taze inekte KMT düşükken MP yoğunluğu 130'u aşar.
+MP_DENSITY_CAP = {"lactating": 112.0, "dry_faroff": 86.0, "dry_closeup": 96.0}
+# HP üst sınırının hesaplandığı tavan (MP ihtiyacının HP karşılığı bunu aşmasın).
 CP_DENSITY_CAP = 19.0
 
 # Hedef bantları: alt sınır hesaplanan ihtiyaç, üst sınır = alt + bant.
@@ -85,9 +88,10 @@ class Requirements:
     nel_mcal_day: float            # toplam ihtiyaç (tavandan önce)
     nel_min: float                 # Mcal/kg KM
     nel_max: float
-    mp_g_day: float
+    mp_g_day: float                # toplam ihtiyaç (tavandan önce)
+    mp_min: float                  # g MP / kg KM
     cp_kg_day: float
-    cp_min: float                  # % KM
+    cp_min: Optional[float]        # % KM — yalnızca kuru dönem tabanı; sağmalda MP yeter
     cp_max: float
     ca_min: float                  # g/kg KM
     ca_max: float
@@ -170,16 +174,20 @@ def compute_requirements(profile: AnimalProfile) -> Requirements:
             + "; BCS'yi izleyin)."
         )
 
-    cp_pct = cp_kg / dmi * 100.0
-    if cp_pct > CP_DENSITY_CAP:
+    mp_density = mp_total / dmi
+    mp_cap = MP_DENSITY_CAP[profile.group]
+    if mp_density > mp_cap:
         notes.append(
-            f"Protein ihtiyacı %{cp_pct:.1f} HP'ye denk geliyor; hedef %{CP_DENSITY_CAP:.0f}'a "
-            "çekildi (düşük tüketim döneminde bir kısmı vücut proteininden karşılanır)."
+            f"Protein açığı: günde ~{mp_total - mp_cap * dmi:.0f} g MP vücut proteininden "
+            "karşılanıyor (düşük tüketim dönemi)."
         )
-        cp_pct = CP_DENSITY_CAP
+        mp_density = mp_cap
+
+    # HP üst sınırı MP ihtiyacının HP karşılığından kurulur; alt sınır yalnızca kuru dönemde.
+    cp_ref = min(cp_kg / dmi * 100.0, CP_DENSITY_CAP)
     floor = _DRY_CP_FLOOR.get(profile.group)
-    if floor and cp_pct < floor:
-        cp_pct = floor
+    if floor:
+        cp_ref = max(cp_ref, floor)
     cp_band, nel_band = _BANDS[profile.group]
     ca_min, ca_max, p_min, p_max = _MINERALS[profile.group]
 
@@ -190,9 +198,10 @@ def compute_requirements(profile: AnimalProfile) -> Requirements:
         nel_min=round(nel_density, 3),
         nel_max=round(nel_density + nel_band, 3),
         mp_g_day=round(mp_total),
+        mp_min=round(mp_density, 1),
         cp_kg_day=round(cp_kg, 3),
-        cp_min=round(cp_pct, 2),
-        cp_max=round(cp_pct + cp_band, 2),
+        cp_min=floor,
+        cp_max=round(cp_ref + cp_band, 2),
         ca_min=ca_min, ca_max=ca_max, p_min=p_min, p_max=p_max,
         energy_deficit_mcal=round(deficit, 2),
         notes=notes,
@@ -200,8 +209,9 @@ def compute_requirements(profile: AnimalProfile) -> Requirements:
 
 
 def requirements_to_constraints(req: Requirements) -> NutrientConstraints:
-    """İhtiyacı solver kısıtlarına çevirir (enerji NEL üzerinden; ME kısıtı yok)."""
+    """İhtiyacı solver kısıtlarına çevirir (enerji NEL, protein MP üzerinden)."""
     return NutrientConstraints(
+        metabolizable_protein_min=req.mp_min,
         crude_protein_min=req.cp_min,
         crude_protein_max=req.cp_max,
         net_energy_lactation_min=req.nel_min,

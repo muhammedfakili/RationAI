@@ -44,6 +44,9 @@ class FeedIngredient:
     # tüketemez. Sıfır bırakılırsa NDF kısıtları o yem için etkisiz kalır.
     ndf: float = 0.0                     # % KM (Nötr Deterjan Lif)
     net_energy_lactation: float = 0.0    # Mcal/kg KM (NEL)
+    starch: float = 0.0                  # % KM
+    ether_extract: float = 0.0           # ham yağ, % KM
+    rup: float = 0.0                     # by-pass protein, HP'nin %'si
     feed_type: str = "unknown"   # silage/hay/straw/grain/protein/byproduct/fat/mineral/salt
     # Hayvan sağlığı sınırı: 600 kg canlı ağırlık için günlük azami doğal hali miktar.
     # None = as-fed sınırı yok (KM yüzdesi tavanı yeterli).
@@ -67,6 +70,18 @@ class FeedIngredient:
         """Kuru madde kesiri (0-1 arası)."""
         return self.dry_matter / 100.0
 
+    def rup_pct_dm(self) -> float:
+        """Rumende yıkılmayan protein, % KM."""
+        return self.crude_protein * self.rup / 100.0
+
+    def rdp_pct_dm(self) -> float:
+        """Rumende yıkılabilir protein, % KM."""
+        return self.crude_protein - self.rup_pct_dm()
+
+    def tdn_pct(self) -> float:
+        """TSBM % KM, NEL'den geri hesaplanır (NRC 2001: NEL = 0.0245·TSBM − 0.12)."""
+        return (self.net_energy_lactation + 0.12) / 0.0245 if self.net_energy_lactation > 0 else 0.0
+
 
 @dataclass
 class NutrientConstraints:
@@ -84,6 +99,9 @@ class NutrientConstraints:
     dry_matter_min: Optional[float] = None         # % doğal hali
     dry_matter_max: Optional[float] = None
     daily_intake_kg: Optional[float] = None        # kg KM/gün (sabitlenir)
+    # Metabolize protein, g MP / kg KM. Doğrusal değil (mikrobiyal protein = min(enerji,
+    # RDP)), bu yüzden NUTRIENTS'ta değil, solve_ration_problem'de ayrıca kurulur.
+    metabolizable_protein_min: Optional[float] = None
 
 
 @dataclass
@@ -150,6 +168,8 @@ class RationRules:
     forage_ratio_max: float
     silage_base_min: float          # silaj seçiliyse kaba yemin tabanı; 0 = kural yok
     hay_agg_max_with_silage: Optional[float]
+    starch_max: float               # % KM — asidoz
+    fat_max: float                  # ham yağ % KM — rumen fermantasyonu
 
 
 # ⚠️ Kuru inek sağmal kurallarına zorlanırsa (NDF ≤ %35, saman ≤ %8) enerji yoğun,
@@ -162,6 +182,7 @@ RULES_BY_GROUP = {
         ndf_min=28.0, ndf_max=35.0, forage_ndf_min=19.0,
         forage_ratio_min=0.45, forage_ratio_max=0.65,
         silage_base_min=0.25, hay_agg_max_with_silage=0.40,
+        starch_max=28.0, fat_max=7.0,
     ),
     "dry_faroff": RationRules(
         label="Kuru (erken)",
@@ -171,6 +192,7 @@ RULES_BY_GROUP = {
         ndf_min=40.0, ndf_max=55.0, forage_ndf_min=30.0,
         forage_ratio_min=0.70, forage_ratio_max=0.90,
         silage_base_min=0.0, hay_agg_max_with_silage=None,
+        starch_max=18.0, fat_max=5.0,
     ),
     "dry_closeup": RationRules(
         label="Kuru (doğuma yakın)",
@@ -180,6 +202,7 @@ RULES_BY_GROUP = {
         ndf_min=35.0, ndf_max=45.0, forage_ndf_min=25.0,
         forage_ratio_min=0.60, forage_ratio_max=0.80,
         silage_base_min=0.0, hay_agg_max_with_silage=None,
+        starch_max=22.0, fat_max=5.0,
     ),
 }
 LACTATING_RULES = RULES_BY_GROUP["lactating"]
@@ -201,6 +224,17 @@ MIN_INCLUSION_BY_TYPE = {
 NDF_INTAKE_PCT_BW = 1.2                        # kg NDF/gün <= %1.2 x canlı ağırlık
 CA_P_RATIO_MIN, CA_P_RATIO_MAX = 1.5, 2.5
 MIN_DAILY_DM_INTAKE_KG = 12.0                  # hedef verilmezse önemsiz çözümleri engeller
+SALT_MIN_PCT_DM = 0.25                         # seçiliyse tuz en az bu kadar (% KM)
+
+# Protein, NRC 2001 metabolize protein (MP) yaklaşımı:
+#   mikrobiyal HP (MCP) = min(0.13 × TSBM, 0.85 × RDP)       [kg/gün]
+#   MP = 0.64 × MCP + 0.80 × RUP                              [RUP sindirilebilirliği ~%80]
+# RDP dengesi: rumen mikropları, enerjinin izin verdiği MCP'yi üretecek kadar RDP almalı
+# (RDP ≥ 0.13/0.85 × TSBM). Eksi denge = fermente olan enerji boşa gider, sindirim düşer.
+MCP_PER_TDN = 0.13
+MCP_PER_RDP = 0.85
+MP_PER_MCP = 0.64
+RUP_DIGESTIBILITY = 0.80
 
 # Protein korumalı koridor: bu yemlerden biri seçiliyse HP < %12 KM ağır cezalandırılır.
 PROTEIN_GUARDRAIL_PCT = 12.0
@@ -209,7 +243,6 @@ PROTEIN_RICH_FEEDS = frozenset({
 })
 
 # Ceza çarpanları (soft_constraint_penalty'nin katları).
-PENALTY_MIN_INCLUSION = 3.0
 PENALTY_MAX_INCLUSION = 5.0
 PENALTY_FORCED_INCLUSION = 30.0   # "seçtiğim yemi kullan" ekonomik tercihlerin çok önünde
 PENALTY_CA_P_RATIO = 2.0
@@ -227,17 +260,19 @@ NUTRIENTS = {
     "phosphorus": ("phosphorus", 1.0, "phosphorus_g_per_kg_dm", "g/kg KM", "Fosfor", 1),
 }
 DRY_MATTER_BOUND = ("dry_matter_percent", "%", "Kuru madde", 1)
+MP_BOUND = ("mp_g_per_kg_dm", "g/kg KM", "Metabolize protein", 0)
 
 _EMPTY_CONTENT_KEYS = (
     "crude_protein_percent_dm", "metabolic_energy_mcal_per_kg_dm", "calcium_g_per_kg_dm",
     "phosphorus_g_per_kg_dm", "dry_matter_percent", "net_energy_lactation_mcal_per_kg_dm",
     "ndf_percent_dm", "forage_ndf_percent_dm", "forage_ratio_percent",
     "crude_protein_percent_af", "metabolic_energy_mcal_per_kg_af", "calcium_g_per_kg_af",
-    "phosphorus_g_per_kg_af",
+    "phosphorus_g_per_kg_af", "starch_percent_dm", "ether_extract_percent_dm",
+    "rdp_percent_dm", "rup_percent_dm", "mp_g_per_kg_dm", "rdp_balance_g",
 )
 _INTAKE_KEYS = (
     "crude_protein_kg", "metabolic_energy_mcal", "calcium_g", "phosphorus_g",
-    "dry_matter_kg", "ndf_kg", "net_energy_lactation_mcal",
+    "dry_matter_kg", "ndf_kg", "net_energy_lactation_mcal", "mp_g",
 )
 
 
@@ -261,6 +296,9 @@ def feeds_from_db(db_feeds) -> List[FeedIngredient]:
             metabolic_energy=feed.metabolic_energy,
             net_energy_lactation=feed.net_energy_lactation or 0.0,
             ndf=feed.ndf or 0.0,
+            starch=feed.starch or 0.0,
+            ether_extract=feed.ether_extract or 0.0,
+            rup=feed.rup or 0.0,
             calcium=feed.calcium,
             phosphorus=feed.phosphorus,
             feed_type=feed.feed_type or "unknown",
@@ -404,13 +442,19 @@ def solve_ration_problem(
             )
 
     windowed: Dict[str, List[str]] = {}
+    # KM için büyük-M: doğal hali tüketim tavanı KM'yi de sınırlar.
+    big_m = max_daily_intake_kg or 50.0
     for feed in feeds:
         min_frac = MIN_INCLUSION_BY_TYPE.get(feed.feed_type, 0.01)
-        # Zorunlu dahil açıkken ayrıca yumuşak minimum kurulmaz (çift ceza olurdu).
+        # Zorunlu dahil kapalıyken minimum "ya hiç ya en az" kuralıdır (yarı sürekli).
+        # ⚠️ Eskiden yumuşak bir alt sınırdı: her yemi rasyona sokmanın bir cezası vardı,
+        # "en ucuz kombinasyon" isteyene 28-33 yemlik rasyon çıkıyordu.
+        # Zorunlu dahil açıkken kurulmaz (o zaman her yem zaten zorunlu).
         if min_frac > 0 and not force_use_all_feeds:
-            slack = soft(f"min_incl_slack_{feed.name}", PENALTY_MIN_INCLUSION)
-            prob += (feed.dm_fraction() * x[feed.name] >= min_frac * total_dm - slack,
-                     f"Min_Inclusion_{feed.name}")
+            used = pulp.LpVariable(f"used_{feed.name}", cat="Binary")
+            dm_i = feed.dm_fraction() * x[feed.name]
+            prob += dm_i >= min_frac * total_dm - big_m * (1 - used), f"Min_Inclusion_{feed.name}"
+            prob += dm_i <= big_m * used, f"Used_{feed.name}"
             windowed.setdefault(feed.feed_type, []).append(feed.name)
 
         max_slack = 0 if hard_ration_rules else soft(f"max_incl_slack_{feed.name}", PENALTY_MAX_INCLUSION)
@@ -424,7 +468,10 @@ def solve_ration_problem(
             for ftype, names in windowed.items()
         ]
         mode = "KATI" if hard_ration_rules else "yumuşak"
-        adjustments.append(f"🔒 Yem sınıfı dahil pencereleri ({mode}): {'; '.join(parts)}")
+        adjustments.append(
+            f"🔒 Yem sınıfı dahil pencereleri ({mode}; kullanılan yem en az alt sınır kadar "
+            f"girer): {'; '.join(parts)}"
+        )
 
     # ---- Besin hedefleri (HP, ME, Ca, P) ----
     # hard_nutrients=True iken slack yok -> hedefler GARANTİ edilir (model infeasible olabilir).
@@ -518,6 +565,46 @@ def solve_ration_problem(
     else:
         adjustments.append("⚠️ UYARI: Rasyonda hiç kaba yem yok! Rumen sağlığı için silaj/kuru ot ekleyin.")
 
+    # Tuzun modelde besin karşılığı yok (Na izlenmiyor): kural olmasa en ucuz rasyon
+    # tuzu her zaman düşürürdü.
+    salt_feeds = [f for f in feeds if f.feed_type == "salt"]
+    if salt_feeds:
+        prob += (dm_sum(salt_feeds) >= SALT_MIN_PCT_DM / 100.0 * total_dm - rule_slack("salt_min"),
+                 "Salt_Min")
+        adjustments.append(f"🧂 Tuz en az %{SALT_MIN_PCT_DM} KM.")
+
+    # ============================================================
+    # RUMEN SAĞLIĞI: nişasta, yağ, RDP dengesi
+    # NDF lifin yeterli olduğunu söyler ama asidozu yakalamaz: %31 nişastalı bir
+    # rasyon NDF penceresine rahatça sığıyordu.
+    # ============================================================
+    if any(f.starch > 0 for f in feeds):
+        prob += (dm_sum(feeds, lambda f: f.starch) <= rules.starch_max * total_dm + rule_slack("starch_max"),
+                 "Starch_Max")
+        adjustments.append(f"🌾 Nişasta en fazla %{rules.starch_max:.0f} KM (asidoz).")
+    if any(f.ether_extract > 0 for f in feeds):
+        prob += (dm_sum(feeds, lambda f: f.ether_extract) <= rules.fat_max * total_dm + rule_slack("fat_max"),
+                 "Fat_Max")
+
+    total_tdn = dm_sum(feeds, lambda f: f.tdn_pct() / 100.0)   # kg TSBM/gün
+    total_rdp = dm_sum(feeds, lambda f: f.rdp_pct_dm() / 100.0)
+    total_rup = dm_sum(feeds, lambda f: f.rup_pct_dm() / 100.0)
+    if any(f.rup > 0 for f in feeds):
+        prob += (total_rdp >= MCP_PER_TDN / MCP_PER_RDP * total_tdn - rule_slack("rdp_balance"),
+                 "RDP_Balance")
+        adjustments.append("🦠 RDP dengesi: rumen mikropları enerjiye yetecek yıkılabilir protein alıyor.")
+
+    # Metabolize protein. MCP değişkeni yalnızca üstten sınırlı: MP kısıtı onu
+    # yukarı iter, böylece min(enerji, RDP) doğrusal kalır.
+    if constraints.metabolizable_protein_min is not None:
+        mcp = pulp.LpVariable("microbial_cp", lowBound=0)
+        prob += mcp <= MCP_PER_TDN * total_tdn, "MCP_Energy"
+        prob += mcp <= MCP_PER_RDP * total_rdp, "MCP_RDP"
+        mp_supply = MP_PER_MCP * mcp + RUP_DIGESTIBILITY * total_rup     # kg MP/gün
+        slack = 0 if hard_nutrients else soft("slack_metabolizable_protein_min", 1.0)
+        prob += (mp_supply >= constraints.metabolizable_protein_min / 1000.0 * total_dm - slack,
+                 "metabolizable_protein_min")
+
     # ==================== AMAÇ FONKSİYONU (EN SONDA, TEK SEFERDE) ====================
     prob += feed_cost + pulp.lpSum(penalties), "Total_Cost"
 
@@ -557,6 +644,10 @@ def solve_ration_problem(
         ndf = actual(lambda f: f.ndf) / 100.0           # kg NDF/gün
         forage_dm = actual(subset=forage_feeds)
         forage_ndf = actual(lambda f: f.ndf, forage_feeds) / 100.0
+        rdp = actual(lambda f: f.rdp_pct_dm() / 100.0)
+        rup = actual(lambda f: f.rup_pct_dm() / 100.0)
+        tdn = actual(lambda f: f.tdn_pct() / 100.0)
+        mp = MP_PER_MCP * min(MCP_PER_TDN * tdn, MCP_PER_RDP * rdp) + RUP_DIGESTIBILITY * rup
 
         nutrient_content.update({
             "crude_protein_percent_dm": cp / actual_dm * 100,
@@ -572,13 +663,19 @@ def solve_ration_problem(
             "metabolic_energy_mcal_per_kg_af": me / total_kg,
             "calcium_g_per_kg_af": ca / total_kg,
             "phosphorus_g_per_kg_af": p / total_kg,
+            "starch_percent_dm": actual(lambda f: f.starch) / actual_dm,
+            "ether_extract_percent_dm": actual(lambda f: f.ether_extract) / actual_dm,
+            "rdp_percent_dm": rdp / actual_dm * 100,
+            "rup_percent_dm": rup / actual_dm * 100,
+            "mp_g_per_kg_dm": mp * 1000 / actual_dm,
+            "rdp_balance_g": (rdp - MCP_PER_TDN / MCP_PER_RDP * tdn) * 1000,
         })
         if p > 0:
             nutrient_content["ca_p_ratio"] = ca / p
         daily_intake.update({
             "crude_protein_kg": cp, "metabolic_energy_mcal": me, "calcium_g": ca,
             "phosphorus_g": p, "dry_matter_kg": actual_dm, "ndf_kg": ndf,
-            "net_energy_lactation_mcal": nel,
+            "net_energy_lactation_mcal": nel, "mp_g": mp * 1000,
         })
 
     actual_feed_cost = sum(f.price_per_kg * amounts[f.name] for f in feeds)
@@ -597,10 +694,11 @@ def solve_ration_problem(
     if total_kg > 0 and actual_dm > 0:
         bounds = {key: spec[2:] for key, spec in NUTRIENTS.items()}
         bounds["dry_matter"] = DRY_MATTER_BOUND
+        bounds["metabolizable_protein"] = MP_BOUND
         for key, (content_key, unit, label, digits) in bounds.items():
             value = nutrient_content[content_key]
             for side in ("min", "max"):
-                target = getattr(constraints, f"{key}_{side}")
+                target = getattr(constraints, f"{key}_{side}", None)
                 if target is None:
                     continue
                 name = f"{key}_{side}"
@@ -779,6 +877,7 @@ def optimization_result_to_schema(
     unit_by_key = {key: spec[3] for key, spec in NUTRIENTS.items()}
     content_by_key = {key: spec[2] for key, spec in NUTRIENTS.items()}
     unit_by_key["dry_matter"], content_by_key["dry_matter"] = DRY_MATTER_BOUND[1], DRY_MATTER_BOUND[0]
+    unit_by_key["metabolizable_protein"], content_by_key["metabolizable_protein"] = MP_BOUND[1], MP_BOUND[0]
 
     constraints_status = []
     for name, status in result.constraints_status.items():
@@ -824,6 +923,12 @@ def optimization_result_to_schema(
             metabolic_energy_mcal_per_kg_af=r(content, "metabolic_energy_mcal_per_kg_af", 3),
             calcium_g_per_kg_af=r(content, "calcium_g_per_kg_af", 2),
             phosphorus_g_per_kg_af=r(content, "phosphorus_g_per_kg_af", 2),
+            starch_percent_dm=r(content, "starch_percent_dm", 1),
+            ether_extract_percent_dm=r(content, "ether_extract_percent_dm", 1),
+            rdp_percent_dm=r(content, "rdp_percent_dm", 1),
+            rup_percent_dm=r(content, "rup_percent_dm", 1),
+            mp_g_per_kg_dm=r(content, "mp_g_per_kg_dm", 1),
+            rdp_balance_g=r(content, "rdp_balance_g", 0),
         ),
         daily_intake=DailyNutrientIntake(
             crude_protein_kg=r(intake, "crude_protein_kg", 3),
@@ -833,6 +938,7 @@ def optimization_result_to_schema(
             dry_matter_kg=r(intake, "dry_matter_kg", 2),
             net_energy_lactation_mcal=r_opt(intake, "net_energy_lactation_mcal", 2),
             ndf_kg=r_opt(intake, "ndf_kg", 3),
+            mp_g=r_opt(intake, "mp_g", 0),
         ),
         constraints_status=constraints_status,
         turkish_explanations=result.adjustments,
@@ -866,6 +972,10 @@ def format_result_for_agent(result: OptimizationResult) -> str:
         f"  - Kalsiyum: {content.get('calcium_g_per_kg_dm', 0):.2f} g/kg KM",
         f"  - Fosfor: {content.get('phosphorus_g_per_kg_dm', 0):.2f} g/kg KM",
         f"  - Kuru madde: {content.get('dry_matter_percent', 0):.1f}% (doğal hali)",
+        f"  - Metabolize protein: {result.daily_nutrient_intake.get('mp_g', 0):.0f} g/gün "
+        f"(RDP %{content.get('rdp_percent_dm', 0):.1f}, RUP %{content.get('rup_percent_dm', 0):.1f} KM)",
+        f"  - Nişasta: %{content.get('starch_percent_dm', 0):.1f} KM · "
+        f"ham yağ: %{content.get('ether_extract_percent_dm', 0):.1f} KM",
     ]
     if content.get("ca_p_ratio"):
         lines.append(f"  - Ca:P oranı: {content['ca_p_ratio']:.2f}")

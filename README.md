@@ -1,79 +1,148 @@
-# RationAI
+# RationAI 🐄
 
-Süt ineği rasyonlarını **maliyet-optimal** ve **besinsel olarak uygulanabilir** biçimde hesaplayan
-tam yığın bir uygulama. Kullanıcı hayvanın canlı ağırlığını ve süt verimini girer, elindeki
-yemleri seçer; sistem hayvan sağlığı sınırlarını çiğnemeden en ucuz karışımı çözer.
+**Süt ineğiniz için en ucuz ama eksiksiz rasyonu saniyeler içinde hesaplayan ücretsiz bir yardımcı.**
 
-```
-Streamlit arayüz  ──HTTP──▶  FastAPI  ──▶  PuLP/CBC doğrusal programlama çözücüsü
-                                    ├──▶  PostgreSQL (yem tablosu, fiyatlar)
-                                    ├──▶  ChromaDB (RAG bilgi tabanı)
-                                    └──▶  LangGraph ajanı → Groq LLM (opsiyonel)
-```
+Elinizdeki yemleri seçin, ineğinizi tanıtın; RationAI hayvanın ihtiyacını tam karşılayan,
+sağlığını riske atmayan **en düşük maliyetli karışımı** kilogram kilogram çıkarsın.
 
-## Hızlı başlangıç
+---
+
+## Neden RationAI?
+
+Yem, süt üretiminde giderin en büyük kalemi. Rasyonu göz kararı hazırlamak iki yoldan para kaybettirir:
+
+- **Fazla verilen** protein ve enerji doğrudan cebinizden çıkar.
+- **Eksik ya da dengesiz** rasyon süt verimini düşürür; asidoz, süt humması, kondisyon kaybı gibi
+  sorunlar veteriner masrafı olarak geri döner.
+
+RationAI bu dengeyi sizin yerinize kurar: ineğin ihtiyacını uluslararası standarda
+(**NASEM 2021**, ABD Ulusal Bilimler Akademisi'nin güncel süt sığırı besleme rehberi) göre hesaplar,
+sonra elinizdeki yemlerle bu ihtiyacı karşılayan **en ucuz** kombinasyonu bulur.
+
+## Kimler için?
+
+- **Süt sığırı yetiştiricileri** — kendi rasyonunu kendi hazırlamak isteyen çiftçiler
+- **Zooteknistler ve besleme danışmanları** — sahada hızlı rasyon taslağı için
+- **Yem bayileri ve kooperatifler** — müşterisine yem önerisi yapanlar
+- **Ziraat / veteriner öğrencileri** — rasyon mantığını uygulamalı görmek için
+
+## Nasıl çalışır? 3 adım
+
+1. **İneğinizi tanıtın.** Grup (sağmal / kuru dönem), canlı ağırlık, günlük süt. İsterseniz süt yağı,
+   laktasyon günü ve gebelik gününü de girin — girmezseniz makul varsayılanlar kullanılır.
+2. **Yemlerinizi seçin.** Silaj, kuru ot, saman, tahıl, küspe… 37 yemlik listeden elinizde
+   olanları işaretleyin. Kendi alış fiyatınızı yazabilirsiniz.
+3. **"Rasyonu hesapla"ya basın.** Her yemden günde kaç kilo vereceğinizi, günlük ve aylık maliyeti
+   ve ineğin ihtiyacının karşılanıp karşılanmadığını görün.
+
+## Örnek sonuç
+
+600 kg, günde 30 litre süt veren, laktasyonun 150. gününde bir inek
+(Temmuz 2026 taban fiyatlarıyla):
+
+| Yem | kg/gün (yaş) | TL/gün |
+|---|---:|---:|
+| Mısır silajı | 24.5 | 122.51 |
+| Mısır | 4.8 | 55.56 |
+| Soya küspesi | 3.6 | 70.95 |
+| Ayçiçeği küspesi | 2.8 | 35.43 |
+| Buğday samanı | 1.9 | 10.57 |
+| Buğday kepeği | 0.7 | 7.15 |
+| Arpa | 0.7 | 8.54 |
+| Yonca kuru otu | 0.7 | 13.27 |
+| Mermer tozu · DCP · tuz | 0.6 | 4.13 |
+| **Toplam** | **40.5** | **328.11** |
+
+**Litre süt başına yem maliyeti ≈ 10.9 TL** · aylık ≈ 9.840 TL.
+Rasyon; enerji, metabolize protein, kalsiyum, fosfor, lif (NDF), kaba yem oranı ve nişasta
+hedeflerinin **hepsini** karşılıyor.
+
+## İneğinizin sağlığını nasıl korur?
+
+RationAI "en ucuz"u ararken şu kurallardan asla taviz vermez:
+
+- 🌾 **Asidoz koruması** — nişasta sağmalda kuru maddenin %28'ini geçmez, tahıl payı sınırlıdır.
+- 🌿 **Geviş getirme için yeterli lif** — rasyonun en az %45'i kaba yemdir, NDF %28–35 aralığındadır.
+- 🥛 **Kuru dönem ayrı beslenir** — doğuma yakın inekte enerji ve kalsiyum sınırlanır
+  (yağlanma ve süt humması riskine karşı), saman payı artırılabilir.
+- ⚖️ **Mineral dengesi** — Ca:P oranı 1.5–2.5; seçilen tuz en ucuz rasyonda bile düşürülmez.
+- 🚫 **Günlük azami miktarlar** — örneğin bir ineğe günde 25 kg'dan fazla silaj, 4 kg'dan fazla
+  saman verilmez (canlı ağırlığa göre ölçeklenir). Bu sınırlar hiçbir durumda aşılmaz.
+- 💬 **Dürüst uyarılar** — seçtiğiniz yemlerle ihtiyaç karşılanamıyorsa bunu açıkça söyler ve
+  hangi yemi eklemeniz gerektiğini önerir. Taze inekte enerji açığı gibi kaçınılmaz durumları
+  da not olarak belirtir.
+
+## Güncel yem fiyatları
+
+"Güncel piyasa fiyatlarını çek" butonu **TOBB ticaret borsalarından** canlı fiyat getirir.
+Borsalarda yalnızca tahıl (mısır, arpa, buğday, yulaf, nohut) işlem gördüğü için silaj, kuru ot,
+küspe ve mineraller taban fiyatta kalır — her yemin yanında fiyatın nereden geldiği yazar.
+Kendi alış fiyatınızı tabloya yazarsanız hesap onunla yapılır.
+
+## Soru da sorabilirsiniz
+
+Sohbet kutusuna Türkçe yazın: *"650 kiloluk, 35 litre veren ineğe silaj, yonca, arpa ve soyayla
+rasyon hazırla"* ya da *"Rasyonda nişasta neden sınırlanır?"*. Asistan rasyonu yine aynı hesap
+motoruyla yapar — miktarları kafasından yazmaz.
+
+## Ücretsiz mi?
+
+Evet. Rasyon hesaplama tamamen ücretsizdir ve internet bağlantısı olmadan da çalışır. Sadece sohbet
+özelliği için ücretsiz bir [Groq](https://console.groq.com) anahtarı gerekir; anahtar yoksa sohbet
+kapanır, geri kalan her şey çalışır.
+
+> ⚠️ **Not:** RationAI bir karar destek aracıdır. Yem besin değerleri tablolardaki tipik
+> değerlerdir; yeminizin laboratuvar analizi varsa sonuç daha isabetli olur. Hasta, çok yüksek
+> verimli veya özel durumdaki hayvanlar için veteriner hekim ya da zooteknistinize danışın.
+
+---
+
+## Teknik bilgi
+
+### Kurulum
+
+**Docker ile (önerilen):**
 
 ```bash
-cp .env.example .env      # Groq anahtarı OPSİYONEL, boş bırakabilirsiniz
+cp .env.example .env      # Groq anahtarı opsiyonel, boş bırakabilirsiniz
 docker compose up
 ```
 
-- Arayüz: <http://localhost:8501>
-- API dokümanı: <http://localhost:8000/docs>
-- Sağlık kontrolü: <http://localhost:8000/api/v1/health>
+- Arayüz: <http://localhost:8501> · API dokümanı: <http://localhost:8000/docs>
 
-İlk açılışta veritabanı otomatik olarak **37 yemle** tohumlanır; RAG indeksi imajın içinde hazır
-gelir, indirme beklemesi yoktur.
-
-### Groq anahtarı olmadan ne çalışır?
-
-Anahtarsız **her şey** çalışır: rasyon optimizasyonu, yem listesi, canlı fiyat senkronu ve
-bilgi tabanı araması. Yalnızca serbest metin sohbeti (`POST /api/v1/agent/query`) devre dışı
-kalır ve açıklayıcı bir `503` döner. Sohbeti denemek isterseniz
-[console.groq.com](https://console.groq.com) üzerinden ücretsiz bir anahtar alıp `.env` içindeki
-`GROQ_API_KEY` alanına yazın.
-
-## Projenin ilginç yanı: iki ayrı istek yolu
-
-| Yol | Uç nokta | LLM devrede mi? |
-|---|---|---|
-| **Hesaplama** | `POST /api/v1/optimize` | **Hayır.** Seçilen yemler ve kısıtlar birebir çözücüye gider — sonuç tekrarlanabilir ve denetlenebilir. |
-| **Sohbet** | `POST /api/v1/agent/query` | Evet; LangGraph ajanı bilgi tabanını arar, yem verisini çeker, gerekirse aynı çözücüyü çağırır. |
-
-Arayüzdeki "Rasyonu Hesapla" düğmesi **her zaman** deterministik yolu kullanır. Bir rasyon
-hesabında LLM'in yemleri yeniden adlandırması ya da sessizce düşürmesi kabul edilemez.
-
-## Çözücü ne yapıyor?
-
-Amaç fonksiyonu günlük yem maliyetini minimize eder; asıl iş kısıtlarda:
-
-- **Besin hedefleri** — HP, ME, Ca, P. Önce **hard** kısıt olarak denenir; yalnızca çözümsüzse
-  gevşetilip Türkçe açıklama üretilir (`nutrition_mode: hard | relaxed | infeasible`).
-- **Fizyolojik uygulanabilirlik** — NDF penceresi %28–35, kaba yem NDF'i ≥ %19, kaba yem oranı
-  %45–65, Ca:P oranı 1.5–2.5.
-- **Yem tipi tavanları** — saman %8, tahıl %30 (asidoz), yağ %4 … Saman kuru madde başına en ucuz
-  yemdir; tavan olmasa çözücü rasyonu samanla doldurur.
-- **Hayvan sağlığı sınırları** — günlük azami doğal hali miktarlar (silaj 25 kg, melas 1.5 kg…),
-  canlı ağırlıkla ölçeklenir. Bunlar **hiçbir koşulda** gevşetilmez.
-
-## Fiyatlar
-
-`borsa.tobb.org.tr` üzerinden **canlı** fiyat çekilir; ancak borsalarda yalnızca tahıl danesi işlem
-gördüğü için ~5 yem canlı, kalan ~32 yem küratörlü taban fiyattadır. Her yem hangi kaynaktan
-geldiğini (`price_source`, ör. `"Bandırma TB · 2026-07-28"`) taşır ve arayüz bunu gösterir —
-taban fiyatlar asla canlıymış gibi sunulmaz.
-
-## Docker'sız çalıştırma
+**Docker'sız (Windows):**
 
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt     # Linux/macOS: .venv/bin/pip
+.venv/Scripts/pip install -r requirements.txt
 .venv/Scripts/python quickstart.py
 ```
 
-Bu yol varsayılan olarak SQLite kullanır (`DATABASE_URL=sqlite:///rationai.db`).
+`quickstart.py` veritabanını hazırlar, bilgi tabanını kurar, backend ve arayüzü birlikte açar
+(Ctrl+C ikisini de kapatır). Varsayılan veritabanı SQLite'tır.
 
-## Teknoloji
+### Mimari
+
+```
+Streamlit arayüz ──HTTP──▶ FastAPI ──▶ PuLP/CBC doğrusal programlama (rasyon çözücü)
+                                  ├──▶ requirements.py (NASEM 2021 ihtiyaç modeli)
+                                  ├──▶ PostgreSQL / SQLite (yem tablosu, fiyatlar)
+                                  ├──▶ ChromaDB (bilgi tabanı araması)
+                                  └──▶ LangGraph ajanı → Groq LLM (opsiyonel sohbet)
+```
+
+- **İki ayrı yol:** "Rasyonu hesapla" butonu `POST /api/v1/optimize` üzerinden doğrudan çözücüye
+  gider — LLM yoktur, sonuç tekrarlanabilir ve denetlenebilir. Sohbet (`/api/v1/agent/query`)
+  aynı çözücüyü araç olarak çağırır.
+- **İhtiyaç modeli:** NASEM 2021 kuru madde tüketimi, NEL (net enerji) ve metabolize protein;
+  sağmal, kuru (erken) ve kuru (doğuma yakın) grupları için ayrı rasyon kuralları.
+- **Çözücü:** iki aşamalı. Önce tüm besin hedefleri ve rasyon kuralları kesin kısıt olarak denenir;
+  çözümsüzse gevşetilir ve Türkçe teşhis üretilir (`nutrition_mode: hard | relaxed | infeasible`).
+  Protein NRC 2001 tarzında hesaplanır: mikrobiyal protein = min(0.13·TSBM, 0.85·RDP),
+  MP = 0.64·mikrobiyal + 0.80·RUP.
+- **Fiyatlar:** `borsa.tobb.org.tr` kazınır; her yem fiyat kaynağını (`price_source`) taşır.
+
+### Teknoloji
 
 FastAPI · Streamlit · SQLAlchemy · PostgreSQL · PuLP (CBC) · ChromaDB · LangChain/LangGraph ·
-Groq (Llama 3.3 70B) · Docker Compose
+Groq (gpt-oss-120b) · Docker Compose

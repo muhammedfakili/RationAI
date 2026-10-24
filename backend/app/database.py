@@ -27,6 +27,9 @@ _ADDED_COLUMNS = {
     "price_source": "VARCHAR",
     "price_updated_at": "TIMESTAMP",
     "max_kg_per_day": "FLOAT",
+    "starch": "FLOAT",
+    "ether_extract": "FLOAT",
+    "rup": "FLOAT",
 }
 
 
@@ -84,6 +87,11 @@ def seed_initial_feeds(db):
 #   CP    : % KM                    ME  : Mcal/kg KM
 #   NEL   : Mcal/kg KM              NDF : % KM
 #   Ca, P : g/kg KM
+#   starch: nişasta % KM            EE  : ham yağ % KM
+#   RUP   : by-pass (rumende yıkılmayan) protein, HAM PROTEİNİN %'si — RDP = HP × (1 − RUP)
+#
+# Nişasta, EE ve RUP NRC 2001 tablolarındaki tipik değerlerdir (ısıl işlem görmemiş yem);
+# laboratuvar analizi varsa onunla değiştirilmeli.
 #
 # `feed_type` rasyon kurallarını belirler (bkz. optimization.MAX_INCLUSION_BY_TYPE):
 #   silage · hay · straw · grain · protein · byproduct · fat · mineral · salt
@@ -100,63 +108,63 @@ def seed_initial_feeds(db):
 _FEED_FIELDS = (
     "name", "feed_type", "price_per_kg", "dry_matter", "crude_protein",
     "metabolic_energy", "net_energy_lactation", "ndf", "calcium", "phosphorus",
-    "max_kg_per_day",
+    "max_kg_per_day", "starch", "ether_extract", "rup",
 )
 
 _CURATED_FEEDS = [
     # ---- KABA YEM: Silajlar ------------------------------------------------
     # Silaj sağlık sınırı 25 kg/gün: fazlası asidoz ve ishal yapar.
-    ("Mısır Silajı",             "silage",    5.0, 30.0,  8.0, 2.30, 1.55, 45.0,   3.0,   2.0, 25.0),
-    ("Yonca Silajı",             "silage",    6.0, 35.0, 18.0, 2.25, 1.35, 45.0,  13.0,   3.0, 25.0),
-    ("Arpa Hasılı Silajı",       "silage",    4.5, 30.0, 10.0, 2.20, 1.35, 55.0,   4.0,   2.5, 25.0),
-    ("İtalyan Çimi Silajı",      "silage",    5.0, 30.0, 13.0, 2.30, 1.40, 50.0,   6.0,   3.0, 25.0),
+    ("Mısır Silajı",             "silage",    5.0, 30.0,  8.0, 2.30, 1.55, 45.0,   3.0,   2.0, 25.0,  32.0,   3.2,   27),
+    ("Yonca Silajı",             "silage",    6.0, 35.0, 18.0, 2.25, 1.35, 45.0,  13.0,   3.0, 25.0,   2.0,   3.0,   20),
+    ("Arpa Hasılı Silajı",       "silage",    4.5, 30.0, 10.0, 2.20, 1.35, 55.0,   4.0,   2.5, 25.0,  15.0,   3.0,   22),
+    ("İtalyan Çimi Silajı",      "silage",    5.0, 30.0, 13.0, 2.30, 1.40, 50.0,   6.0,   3.0, 25.0,   2.0,   3.5,   20),
 
     # ---- KABA YEM: Kuru otlar ----------------------------------------------
-    ("Yonca Kuru Otu",           "hay",      18.0, 88.0, 17.5, 2.35, 1.42, 40.0,  12.0,   3.0, None),
-    ("Çayır Otu",                "hay",      12.0, 85.0, 10.0, 2.05, 1.10, 55.0,   6.0,   2.5, None),
-    ("Fiğ Kuru Otu",             "hay",      16.0, 88.0, 15.0, 2.25, 1.35, 45.0,  11.0,   2.5, None),
-    ("Korunga Kuru Otu",         "hay",      15.0, 88.0, 14.0, 2.20, 1.30, 46.0,  12.0,   2.4, None),
+    ("Yonca Kuru Otu",           "hay",      18.0, 88.0, 17.5, 2.35, 1.42, 40.0,  12.0,   3.0, None,   2.0,   2.5,   22),
+    ("Çayır Otu",                "hay",      12.0, 85.0, 10.0, 2.05, 1.10, 55.0,   6.0,   2.5, None,   2.0,   2.5,   25),
+    ("Fiğ Kuru Otu",             "hay",      16.0, 88.0, 15.0, 2.25, 1.35, 45.0,  11.0,   2.5, None,   3.0,   2.5,   25),
+    ("Korunga Kuru Otu",         "hay",      15.0, 88.0, 14.0, 2.20, 1.30, 46.0,  12.0,   2.4, None,   3.0,   2.5,   35),
 
     # ---- KABA YEM: Samanlar ------------------------------------------------
-    ("Buğday Samanı",            "straw",     5.5, 90.0,  3.5, 1.55, 0.90, 78.0,   3.0,   0.8,  4.0),
-    ("Arpa Samanı",              "straw",     5.5, 90.0,  4.5, 1.65, 0.95, 74.0,   3.5,   1.0,  4.0),
+    ("Buğday Samanı",            "straw",     5.5, 90.0,  3.5, 1.55, 0.90, 78.0,   3.0,   0.8,  4.0,   1.0,   1.5,   35),
+    ("Arpa Samanı",              "straw",     5.5, 90.0,  4.5, 1.65, 0.95, 74.0,   3.5,   1.0,  4.0,   1.0,   1.8,   35),
 
     # ---- KESİF YEM: Tahıl daneleri (TOBB borsasından canlı güncellenir) -----
-    ("Mısır",                    "grain",    14.0, 88.0,  8.5, 3.35, 2.05, 10.0,   0.4,   2.8, None),
-    ("Buğday",                   "grain",    15.5, 87.0, 12.0, 3.25, 2.00, 12.0,   0.5,   3.5, None),
-    ("Arpa",                     "grain",    14.8, 88.0, 11.0, 3.00, 1.85, 18.0,   0.6,   3.2, None),
-    ("Yulaf",                    "grain",    13.5, 88.1, 11.5, 2.95, 1.80, 25.0,   0.7,   3.0, None),
-    ("Tritikale",                "grain",    14.0, 87.3, 10.5, 3.10, 1.90, 14.0,   0.6,   3.0, None),
+    ("Mısır",                    "grain",    14.0, 88.0,  8.5, 3.35, 2.05, 10.0,   0.4,   2.8, None,  72.0,   4.2,   52),
+    ("Buğday",                   "grain",    15.5, 87.0, 12.0, 3.25, 2.00, 12.0,   0.5,   3.5, None,  65.0,   2.0,   25),
+    ("Arpa",                     "grain",    14.8, 88.0, 11.0, 3.00, 1.85, 18.0,   0.6,   3.2, None,  58.0,   2.2,   30),
+    ("Yulaf",                    "grain",    13.5, 88.1, 11.5, 2.95, 1.80, 25.0,   0.7,   3.0, None,  45.0,   5.0,   20),
+    ("Tritikale",                "grain",    14.0, 87.3, 10.5, 3.10, 1.90, 14.0,   0.6,   3.0, None,  62.0,   1.8,   25),
 
     # ---- KESİF YEM: Protein kaynakları -------------------------------------
-    ("Soya Küspesi",             "protein",  19.5, 89.0, 45.0, 3.10, 1.95, 14.0,   2.8,   6.5, None),
-    ("Soya-Fullfat",             "protein",  23.5, 88.1, 35.0, 3.80, 2.35, 12.0,   2.5,   5.8, None),
-    ("Ayçiçeği Küspesi",         "protein",  12.5, 90.0, 32.0, 2.70, 1.45, 40.0,   3.0,  10.0, None),
-    ("Kolza Küspesi",            "protein",  14.0, 92.2, 36.0, 2.60, 1.35, 30.0,   4.0,   9.0, None),
-    ("Pamuk Tohumu Küspesi",     "protein",  13.5, 90.0, 40.0, 2.60, 1.50, 30.0,   2.0,  11.0, None),
-    ("Tam Yağlı Çiğit",          "protein",  14.5, 92.0, 23.0, 3.40, 2.00, 50.0,   1.5,   6.0, None),
-    ("Mısır Gluten Yemi",        "protein",  15.5, 88.0, 20.0, 3.05, 1.90, 36.0,   0.6,   4.0, None),
-    ("Mısır DDGS",               "protein",  13.5, 88.2, 25.0, 3.20, 2.00, 32.0,   0.5,   7.5, None),
-    ("Buğday DDGS",              "protein",  13.0, 90.0, 34.0, 3.30, 2.05, 34.0,   0.6,   8.0, None),
-    ("Kuru Bira Posası",         "protein",   9.5, 92.0, 25.0, 2.60, 1.50, 47.0,   3.0,   6.0, None),
-    ("Nohut",                    "protein",  30.0, 88.0, 24.7, 3.00, 1.85, 18.0,   1.0,   4.5, None),
+    ("Soya Küspesi",             "protein",  19.5, 89.0, 45.0, 3.10, 1.95, 14.0,   2.8,   6.5, None,   3.0,   1.5,   37),
+    ("Soya-Fullfat",             "protein",  23.5, 88.1, 35.0, 3.80, 2.35, 12.0,   2.5,   5.8, None,   4.0,  20.0,   30),
+    ("Ayçiçeği Küspesi",         "protein",  12.5, 90.0, 32.0, 2.70, 1.45, 40.0,   3.0,  10.0, None,   1.0,   2.5,   26),
+    ("Kolza Küspesi",            "protein",  14.0, 92.2, 36.0, 2.60, 1.35, 30.0,   4.0,   9.0, None,   2.0,   3.5,   35),
+    ("Pamuk Tohumu Küspesi",     "protein",  13.5, 90.0, 40.0, 2.60, 1.50, 30.0,   2.0,  11.0, None,   1.0,   2.0,   43),
+    ("Tam Yağlı Çiğit",          "protein",  14.5, 92.0, 23.0, 3.40, 2.00, 50.0,   1.5,   6.0, None,   1.0,  19.0,   30),
+    ("Mısır Gluten Yemi",        "protein",  15.5, 88.0, 20.0, 3.05, 1.90, 36.0,   0.6,   4.0, None,  18.0,   3.5,   25),
+    ("Mısır DDGS",               "protein",  13.5, 88.2, 25.0, 3.20, 2.00, 32.0,   0.5,   7.5, None,   5.0,  10.0,   52),
+    ("Buğday DDGS",              "protein",  13.0, 90.0, 34.0, 3.30, 2.05, 34.0,   0.6,   8.0, None,   4.0,   5.0,   45),
+    ("Kuru Bira Posası",         "protein",   9.5, 92.0, 25.0, 2.60, 1.50, 47.0,   3.0,   6.0, None,   5.0,   9.0,   58),
+    ("Nohut",                    "protein",  30.0, 88.0, 24.7, 3.00, 1.85, 18.0,   1.0,   4.5, None,  45.0,   6.0,   25),
 
     # ---- KESİF YEM: Yan ürünler --------------------------------------------
-    ("Buğday Kepeği",            "byproduct", 9.6, 87.1, 15.0, 2.60, 1.40, 42.0,   1.0,   9.0, None),
-    ("Mısır Kepeği",             "byproduct",10.3, 87.8, 10.0, 2.70, 1.50, 55.0,   0.5,   5.5, None),
-    ("Şeker Pancarı Posası",     "byproduct",11.0, 89.1,  9.0, 2.80, 1.65, 42.0,   6.0,   1.0, None),
-    ("Yaş Şeker Pancarı Posası", "byproduct", 2.5, 22.0, 10.0, 2.70, 1.60, 45.0,   8.0,   1.0, 20.0),
-    ("Melas",                    "byproduct", 9.0, 75.0,  6.0, 3.00, 1.80,  0.0,   1.5,   0.3,  1.5),
+    ("Buğday Kepeği",            "byproduct", 9.6, 87.1, 15.0, 2.60, 1.40, 42.0,   1.0,   9.0, None,  22.0,   4.5,   25),
+    ("Mısır Kepeği",             "byproduct",10.3, 87.8, 10.0, 2.70, 1.50, 55.0,   0.5,   5.5, None,  22.0,   6.0,   40),
+    ("Şeker Pancarı Posası",     "byproduct",11.0, 89.1,  9.0, 2.80, 1.65, 42.0,   6.0,   1.0, None,   1.0,   1.0,   45),
+    ("Yaş Şeker Pancarı Posası", "byproduct", 2.5, 22.0, 10.0, 2.70, 1.60, 45.0,   8.0,   1.0, 20.0,   1.0,   1.0,   40),
+    ("Melas",                    "byproduct", 9.0, 75.0,  6.0, 3.00, 1.80,  0.0,   1.5,   0.3,  1.5,   0.0,   0.2,    0),
 
     # ---- KESİF YEM: Korunmuş yağ -------------------------------------------
-    ("Korunmuş Yağ (Bypass)",    "fat",      75.0, 99.0,  0.0, 6.50, 5.50,  0.0,   0.0,   0.0,  0.5),
+    ("Korunmuş Yağ (Bypass)",    "fat",      75.0, 99.0,  0.0, 6.50, 5.50,  0.0,   0.0,   0.0,  0.5,   0.0,  85.0,    0),
 
     # ---- MİNERAL ve KATKILAR -----------------------------------------------
-    ("Mermer Tozu",              "mineral",   3.5, 96.0,  0.0, 0.00, 0.00,  0.0, 380.0,   0.0,  0.4),
-    ("DCP (Dikalsiyum Fosfat)",  "mineral",  14.0, 96.0,  0.0, 0.00, 0.00,  0.0, 220.0, 180.0,  0.2),
-    ("Sodyum Bikarbonat",        "mineral",  22.0, 99.0,  0.0, 0.00, 0.00,  0.0,   0.0,   0.0, 0.25),
-    ("Vitamin-Mineral Premiks",  "mineral",  60.0, 98.0,  0.0, 0.00, 0.00,  0.0, 150.0,  60.0, 0.25),
-    ("Tuz",                      "salt",      5.0, 99.0,  0.0, 0.00, 0.00,  0.0,   0.0,   0.0, 0.15),
+    ("Mermer Tozu",              "mineral",   3.5, 96.0,  0.0, 0.00, 0.00,  0.0, 380.0,   0.0,  0.4,   0.0,   0.0,    0),
+    ("DCP (Dikalsiyum Fosfat)",  "mineral",  14.0, 96.0,  0.0, 0.00, 0.00,  0.0, 220.0, 180.0,  0.2,   0.0,   0.0,    0),
+    ("Sodyum Bikarbonat",        "mineral",  22.0, 99.0,  0.0, 0.00, 0.00,  0.0,   0.0,   0.0, 0.25,   0.0,   0.0,    0),
+    ("Vitamin-Mineral Premiks",  "mineral",  60.0, 98.0,  0.0, 0.00, 0.00,  0.0, 150.0,  60.0, 0.25,   0.0,   0.0,    0),
+    ("Tuz",                      "salt",      5.0, 99.0,  0.0, 0.00, 0.00,  0.0,   0.0,   0.0, 0.15,   0.0,   0.0,    0),
 ]
 
 

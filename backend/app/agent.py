@@ -35,8 +35,22 @@ logger = logging.getLogger(__name__)
 # can only come from forages and the ration lands in relaxed mode.
 DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz")
 
-# English names the LLM sometimes uses -> database name.
-_ENGLISH_FEED_NAMES = {
+# Short or English names the LLM sometimes uses -> database name. The short Turkish
+# names matter: substring matching sent "yonca" to whichever alfalfa feed came first
+# (often the silage) although farmers mean the hay.
+_FEED_ALIASES = {
+    "yonca": "Yonca Kuru Otu",
+    "kuru yonca": "Yonca Kuru Otu",
+    "soya": "Soya Küspesi",
+    "saman": "Buğday Samanı",
+    "silaj": "Mısır Silajı",
+    "ayçiçeği": "Ayçiçeği Küspesi",
+    "kepek": "Buğday Kepeği",
+    "pancar posası": "Şeker Pancarı Posası",
+    "ddgs": "Mısır DDGS",
+    "bypass yağ": "Korunmuş Yağ (Bypass)",
+    "mermer tozu": "Mermer Tozu",
+    "dcp": "DCP (Dikalsiyum Fosfat)",
     "corn": "Mısır",
     "wheat": "Buğday",
     "barley": "Arpa",
@@ -122,7 +136,7 @@ def parse_constraints(raw: Any, expected_dm_intake_kg: Optional[float] = None) -
 def _match_feed_names(requested: List[str], all_names: List[str]) -> List[str]:
     """Map LLM feed names onto database names: exact, English alias, then substring."""
     by_lower = {name.lower(): name for name in all_names}
-    by_lower.update({en: tr for en, tr in _ENGLISH_FEED_NAMES.items() if tr in all_names})
+    by_lower.update({alias: name for alias, name in _FEED_ALIASES.items() if name in all_names})
     matched: List[str] = []
     for name in requested:
         key = name.lower()
@@ -150,7 +164,8 @@ def get_feed_data() -> ToolResult:
         return "Veritabanında yem verisi yok.", None
     lines = ["Mevcut yemler (besin değerleri KM bazında):"] + [
         f"- {f.name} [{f.feed_type}]: {f.price_per_kg} TL/kg, KM %{f.dry_matter}, "
-        f"HP %{f.crude_protein}, NEL {f.net_energy_lactation} Mcal/kg, "
+        f"HP %{f.crude_protein} (RUP %{f.rup or 0:.0f}'i), NEL {f.net_energy_lactation} Mcal/kg, "
+        f"nişasta %{f.starch or 0:.0f}, yağ %{f.ether_extract or 0:.1f}, "
         f"ME {f.metabolic_energy} Mcal/kg, NDF %{f.ndf}, "
         f"Ca {f.calcium} g/kg, P {f.phosphorus} g/kg"
         for f in feeds
@@ -223,7 +238,7 @@ def calculate_ration(
         + (f", {profile.milk_kg:.0f} kg süt, laktasyonun {profile.days_in_milk}. günü"
            if group == "lactating" else "")
         + f": KMT {req.dm_intake_kg} kg, NEL {req.nel_min}-{req.nel_max} Mcal/kg KM, "
-          f"HP %{target.crude_protein_min}-{target.crude_protein_max} (NASEM 2021)."
+          f"MP {req.mp_g_day:.0f} g/gün (NASEM 2021)."
     ] + [f"ℹ️ {note}" for note in req.notes] + result.adjustments
     structured = optimization_result_to_schema(result, feed_inputs).model_dump()
     return format_result_for_agent(result), structured
@@ -290,6 +305,10 @@ You can call one of these tools:
        List EVERY feed the user mentioned — never leave one out to make it cheaper; the
        solver decides the amounts. Leave empty to let it choose from all feeds.
        Minerals are added automatically when none is listed.
+       Map the user's words literally — never swap a feed for a "similar" one:
+       plain "yonca" (alfalfa) = "Yonca Kuru Otu"; use a silage name ONLY when the user
+       says "silaj"/"silage" (plain "silaj" = "Mısır Silajı"); "soya" = "Soya Küspesi";
+       "saman" = "Buğday Samanı"; "kepek" = "Buğday Kepeği".
      - Describe the ANIMAL; the tool computes the nutrient targets itself (NASEM 2021).
        Do NOT invent nutrient targets.
        - animal_weight (number, kg, default 650)
@@ -312,6 +331,9 @@ You can call one of these tools:
 
 Feeds in the database (Turkish names, grouped by type):
 {feed_list}
+
+NEVER write feed amounts (kg) or a ration yourself — every ration must come from
+calculate_ration, which is always available. If the user asks for a ration, call it.
 
 Respond with ONLY a JSON object, no other text:
 - To call a tool: {{"tool": "<tool name>", "args": {{...}}}}
@@ -344,12 +366,28 @@ def _parse_llm_reply(text: str) -> Tuple[Optional[str], Dict[str, Any], Optional
     return None, {}, text
 
 
-def agent_node(state: AgentState):
-    """Ask the LLM to either pick a tool (with args) or answer directly."""
-    user_query = state["messages"][-1].content
-    prompt = SYSTEM_PROMPT.format(feed_list=_feed_list_for_prompt())
-    ai_msg: AIMessage = _get_llm().invoke([SystemMessage(content=prompt), HumanMessage(content=user_query)])
+# gpt-oss sometimes answers a ration request without calculate_ration: it writes feed
+# amounts itself or claims the tool is unavailable. Made-up amounts meet no constraint,
+# so they are never shown — the request is retried once, then refused. A plain answer
+# to a knowledge question ("rasyonda nişasta neden önemli?") passes untouched.
+_RATION_REQUEST = re.compile(r"rasyon|ration|yemleme", re.IGNORECASE)
+_SUSPECT_ANSWER = re.compile(
+    r"\d+(?:[.,]\d+)?\s*kg|erişilemiyor|kullanılamıyor|unavailable", re.IGNORECASE
+)
+_TOOL_REMINDER = (
+    "This is a ration request. Do not answer with amounts yourself: call calculate_ration "
+    "now. It is available."
+)
+_NO_ANSWER = "Üzgünüm, bu soruya şu an yanıt üretemedim. Lütfen tekrar deneyin."
+_NO_RATION = (
+    "Rasyonu şu an hesaplayamadım. Lütfen tekrar deneyin ya da arayüzdeki "
+    "\"Rasyonu hesapla\" butonunu kullanın — o yol dil modeli olmadan çalışır."
+)
 
+
+def _ask_llm(messages) -> Tuple[AIMessage, Optional[str], Dict[str, Any], str]:
+    """Invoke the LLM; return (raw message, tool_name, tool_args, direct_answer)."""
+    ai_msg: AIMessage = _get_llm().invoke(messages)
     response_text = ai_msg.content.strip()
     from_reasoning = not response_text
     if from_reasoning:
@@ -362,9 +400,27 @@ def agent_node(state: AgentState):
     tool_name, tool_args, direct_answer = _parse_llm_reply(response_text)
     unparsed = direct_answer == response_text  # no JSON envelope was found
     if tool_name is None and (not direct_answer.strip() or (from_reasoning and unparsed)):
-        direct_answer = "Üzgünüm, bu soruya şu an yanıt üretemedim. Lütfen tekrar deneyin."
+        direct_answer = _NO_ANSWER
     logger.debug("LLM ham yanıtı: %s", response_text)
     logger.debug("tool_name=%s, tool_args=%s", tool_name, tool_args)
+    return ai_msg, tool_name, tool_args, direct_answer
+
+
+def agent_node(state: AgentState):
+    """Ask the LLM to either pick a tool (with args) or answer directly."""
+    user_query = state["messages"][-1].content
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT.format(feed_list=_feed_list_for_prompt())),
+        HumanMessage(content=user_query),
+    ]
+    ai_msg, tool_name, tool_args, direct_answer = _ask_llm(messages)
+    if tool_name is None and _RATION_REQUEST.search(user_query) and _SUSPECT_ANSWER.search(direct_answer):
+        logger.info("Rasyon isteği araçsız yanıtlandı, yeniden soruluyor")
+        ai_msg, tool_name, tool_args, direct_answer = _ask_llm(
+            messages + [SystemMessage(content=_TOOL_REMINDER)]
+        )
+        if tool_name is None:
+            direct_answer = _NO_RATION
 
     context = dict(state.get("context", {}))
     if tool_name is not None:

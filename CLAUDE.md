@@ -161,21 +161,24 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
   targets from `/requirements` — **the frontend computes no requirement itself**. Targets are
   only exposed as editable inputs behind the "Gelişmiş ayarlar" → "Besin hedeflerini elle
   ayarla" toggle; in auto mode the payload carries only `animal`. Keep the results
-  view at one screen: summary + donut + 6 nutrient checks (CP/NEL/Ca/P **plus NDF and forage
-  ratio** — the two that say whether the cow can actually eat it; their windows come from the
-  group's rules), everything else in the collapsed "Detaylar" expander. Feeds are picked from
+  view at one screen: summary + donut + 7 nutrient checks (MP/NEL/Ca/P **plus NDF, forage
+  ratio and starch** — the three that say whether the cow can actually eat it; their windows
+  come from the group's rules), everything else in the collapsed "Detaylar" expander. Feeds are picked from
   three boxes (kaba yem / kesif yem / mineral) grouped by `feed_type`; minerals come pre‑selected.
 - **Requirements (`requirements.py`, NASEM 2021) are the single source of targets** for the UI,
   `/optimize` and the agent. Lactating DMI is NASEM Eq. 2‑1, dry DMI the NASEM %BW equation
   (week clamped at −3, heifer × 0.88), milk NE = 9.29·fat + 5.85·true protein + 3.95·lactose,
   NEL maintenance 0.10·BW^0.75, gestation NEL/MP from the NASEM table. **Energy is constrained
-  as NEL**, not ME. Protein is a proxy (MP ÷ 0.64) until feeds carry RDP/RUP.
-  Bands: lactating CP +4.0 / NEL +0.25 (a narrow CP band pushes rations into relaxed mode
-  because the forage/NDF rules pull protein up); dry CP +3 / NEL +0.15 (over‑conditioning).
-  ⚠️ `NEL_DENSITY_CAP` (lactating 1.70, close‑up 1.55, far‑off 1.45) and `CP_DENSITY_CAP` (19 %)
-  were **measured**: the highest density a typical selection reaches in hard mode without
-  dropping any feed. Above it, zero‑energy feeds dilute energy and the solver dropped the
-  salt. The shortfall is reported as a negative‑energy‑balance note, not as relaxed mode.
+  as NEL**, not ME. **Protein is constrained as metabolizable protein** (`metabolizable_protein_min`,
+  g MP/kg DM): the solver computes supply NRC‑2001 style, MCP = min(0.13·TDN, 0.85·RDP) and
+  MP = 0.64·MCP + 0.80·RUP, with TDN back‑calculated from NEL. MCP is an LP variable bounded
+  by both terms, so `min()` stays linear. CP is only a ceiling (MP→CP at 0.64 + band) plus the
+  dry‑cow floor (far‑off 12 %, close‑up 13 %); lactating rations have no CP minimum.
+  Bands: lactating CP +4.0 / NEL +0.25; dry CP +3 / NEL +0.15 (over‑conditioning).
+  ⚠️ `NEL_DENSITY_CAP` (lactating 1.70, close‑up 1.55, far‑off 1.45) and `MP_DENSITY_CAP`
+  (112 / 96 / 86 g/kg DM) were **measured**: the highest density a typical selection reaches in
+  hard mode without dropping any feed. Above it, zero‑energy feeds dilute the ration and the
+  solver dropped the salt. The shortfall is reported as a negative‑balance note, not relaxed mode.
 - **Agent flow:** `run_agent()` → LangGraph `agent → tool_executor → END`. The LLM does *not* use
   native function calling; `agent_node` prompts for a JSON tool call and `tool_executor_node`
   parses it manually. Tools are plain functions in `TOOLS` returning `(text, structured|None)`:
@@ -186,6 +189,11 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
   (nothing forced); with no mineral named it adds the UI's default minerals. The system prompt lists the real feed names from the DB — do not hard-code them.
   `gpt-oss` sometimes leaves `content` empty and puts the JSON at the end of
   `reasoning_content`; `agent_node` reads it from there but never shows raw reasoning.
+  ⚠️ It also sometimes answers a ration request **without the tool**, writing feed amounts
+  itself or claiming the tool is unavailable. Those amounts meet no constraint: when a ration
+  request (`_RATION_REQUEST`) gets a direct answer with kg amounts (`_SUSPECT_ANSWER`),
+  `agent_node` retries once with a reminder and otherwise refuses — never shows them.
+  Groq's free tier is ~8000 tokens/min and one call is ~2000, so back‑to‑back tests hit 429.
   Tool output goes to the user verbatim (no second LLM pass), so a knowledge-base hit is shown
   as the raw chunk.
 - **Structured results:** the optimizer's `OptimizationResult` is converted to the API‑facing
@@ -208,12 +216,14 @@ non‑zero coefficient.
 | Quantity | UI collects | Solver/DB expects | Conversion |
 |---|---|---|---|
 | Calcium, Phosphorus | % of DM (0.6) | **g/kg DM** (6.0) | `× 10` in `build_optimization_payload()` |
-| CP / NEL requirement | animal profile | **concentration** (% DM, Mcal/kg DM) | daily total ÷ daily DM intake, in `requirements.compute_requirements()` |
+| MP / NEL requirement | animal profile | **concentration** (g MP/kg DM, Mcal/kg DM) | daily total ÷ daily DM intake, in `requirements.compute_requirements()` |
+| RUP | — | **% of CP** (not % DM) | `FeedIngredient.rup_pct_dm()` = CP × RUP / 100; RDP is the rest |
 
 Never feed a daily total (kg CP/day, Mcal/day) straight into a concentration constraint, and
 never send a `dry_matter` as‑fed range by default — a silage TMR sits near 35 % DM, so a fixed
 85‑95 % range makes every target unreachable. Leave it unset unless the user asks.
-- **One seed source:** `database.py::_CURATED_FEEDS` (37 feeds, compact tuple table).
+- **One seed source:** `database.py::_CURATED_FEEDS` (37 feeds, compact tuple table). Starch,
+  ether extract and RUP are typical NRC 2001 values (untreated feeds) — lab analyses beat them.
   `seed_initial_feeds()` **upserts** on every startup — it adds missing feeds and refreshes
   nutrient values, `feed_type` and `max_kg_per_day`. `price_per_kg` is only refreshed while
   `price_source` is still `"taban fiyat"`, so live‑scraped and user‑entered prices survive.
@@ -299,6 +309,15 @@ neither has the silage‑base rule (in a dry cow silage energy is what must be l
 - **Ca:P ratio 1.5–2.5.** Hitting Ca and P individually does not guarantee a sane ratio, so it
   is constrained explicitly.
 - **Protein guardrail** — CP below 12 % DM is heavily penalised when protein‑rich feeds are available.
+- **Starch ≤ 28 % DM** (far‑off 18, close‑up 22) and **ether extract ≤ 7 %** (dry 5) — NDF says
+  the fibre is there but does not catch acidosis: a 31 % starch ration fit the NDF window easily.
+- **RDP balance ≥ 0** — RDP must cover what microbes can make from the energy
+  (RDP ≥ 0.13/0.85 × TDN); a negative balance wastes fermented energy.
+- **Salt ≥ 0.25 % DM** when salt is selected — Na is not modelled, so without this rule the
+  cheapest ration always dropped the salt.
+- **Minimum inclusion is semi‑continuous** when `use_all_selected_feeds` is off: a binary per
+  feed, "unused or at least `MIN_INCLUSION_BY_TYPE`". It used to be a soft minimum, which
+  penalised leaving any feed out — "cheapest combination" with all 37 feeds returned 31 of them.
 
 ### Animal‑health caps (as‑fed kg/day) — never relaxed
 `Feed.max_kg_per_day` is the daily as‑fed ceiling **for a 600 kg cow**;
