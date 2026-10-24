@@ -233,3 +233,6 @@ class PriceSyncResponse(BaseModel):
     baseline_feeds_count: int
     source: str
     message: str
+    kept_manual_feeds: List[str] = Field(
+        default_factory=list, description="Feeds left on the user's own saved price"
+    )

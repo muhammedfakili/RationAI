@@ -421,16 +421,19 @@ def update_feed_prices(
         Canlı kaynak bulunamazsa fiyatlara DOKUNULMAZ ve live_count 0 döner —
         eskiden burada sessizce rastgele bir simülasyon çalışıyordu.
     """
+    from .database import MANUAL_SOURCE
+
     now = datetime.now()
     updated: List[Feed] = []
+    kept_manual: List[str] = []
 
     if price_updates is not None:
-        source_label = "elle girildi"
+        source_label = MANUAL_SOURCE
         resolved = {name: (price, source_label, now) for name, price in price_updates.items()}
     else:
         scraper = TurkishFeedPriceScraper(base_prices=_curated_base_prices())
         scraped = scraper.scrape_all()
-        source_label = "TOBB borsa"
+        source_label = "TOBB + Samsun TB"
         resolved = {
             name: (fp.price_per_kg, f"{fp.source} · {fp.date}", now)
             for name, fp in scraped.items()
@@ -440,6 +443,11 @@ def update_feed_prices(
         feed = db.query(Feed).filter(Feed.name == feed_name).first()
         if feed is None:
             logger.warning("Veritabanında bulunmayan yem atlandı: %s", feed_name)
+            continue
+        # Çiftçinin kaydettiği alış fiyatı piyasa ortalamasından daha doğrudur: canlı
+        # senkron onu ezmez. Piyasaya dönmek için `reset_manual_prices()`.
+        if price_updates is None and feed.price_source == MANUAL_SOURCE:
+            kept_manual.append(feed_name)
             continue
         logger.debug("%s: %.2f -> %.2f (%s)", feed_name, feed.price_per_kg or 0, new_price, source)
         feed.price_per_kg = new_price
@@ -454,9 +462,27 @@ def update_feed_prices(
     return {
         "updated": updated,
         "live_count": len(updated),
-        "baseline_count": max(total_feeds - len(updated), 0),
+        "baseline_count": max(total_feeds - len(updated) - len(kept_manual), 0),
         "source": source_label,
+        "kept_manual": kept_manual,
     }
+
+
+def reset_manual_prices(db: Session) -> List[str]:
+    """Elle girilen fiyatları küratörlü taban fiyata döndürür (sonraki senkron günceller)."""
+    from .database import BASELINE_PRICE_DATE, BASELINE_SOURCE, MANUAL_SOURCE
+
+    base = _curated_base_prices()
+    reset = []
+    for feed in db.query(Feed).filter(Feed.price_source == MANUAL_SOURCE).all():
+        if feed.name in base:
+            feed.price_per_kg = base[feed.name]
+            feed.price_source = BASELINE_SOURCE
+            feed.price_updated_at = BASELINE_PRICE_DATE
+            reset.append(feed.name)
+    if reset:
+        db.commit()
+    return reset
 
 
 if __name__ == "__main__":
