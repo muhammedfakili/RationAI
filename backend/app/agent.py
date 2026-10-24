@@ -1,486 +1,239 @@
 """
 Agent module for RationAI - LLM-driven agent using Groq with manual tool parsing.
+
+The LLM does not use native function calling: `agent_node` asks for a JSON tool call
+and `tool_executor_node` parses and runs it. Graph: agent -> tool_executor -> END.
 """
 
-import os
 import json
 import logging
+import os
 import re
-from typing import Dict, List, Any, Optional
-from typing_extensions import TypedDict
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, END
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
-# Import local modules
-from .database import get_db
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_groq import ChatGroq
+from langgraph.graph import END, StateGraph
+
+from .database import SessionLocal
 from .models import Feed
-from .rag import query_documents, ingest_documents
 from .optimization import (
-    optimize_ration,
-    optimization_result_to_schema,
-    FeedInput,
+    RULES_BY_GROUP,
     NutrientConstraints,
-    OptimizationResult,
-    calculate_optimal_ration,
-    FeedIngredient,
-    feeds_from_db
+    feeds_from_db,
+    format_result_for_agent,
+    optimization_result_to_schema,
+    optimize_ration,
 )
-from .schemas import (
-    OptimizationResponse,
-    AgentResponse,
-    sanitize_nutrient_constraints,
-    validate_ration_feasibility
-)
+from .rag import query_documents
+from .requirements import AnimalProfile, compute_requirements, requirements_to_constraints
+from .schemas import AgentResponse
 
 logger = logging.getLogger(__name__)
 
+# Minerals the UI pre-selects; added when the LLM names no mineral, otherwise Ca/P
+# can only come from forages and the ration lands in relaxed mode.
+DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz")
 
-# Define the agent state
+# English names the LLM sometimes uses -> database name.
+_ENGLISH_FEED_NAMES = {
+    "corn": "Mısır",
+    "wheat": "Buğday",
+    "barley": "Arpa",
+    "oats": "Yulaf",
+    "soybean meal": "Soya Küspesi",
+    "full-fat soybean": "Soya-Fullfat",
+    "corn gluten feed": "Mısır Gluten Yemi",
+    "corn bran": "Mısır Kepeği",
+    "wheat bran": "Buğday Kepeği",
+    "alfalfa hay": "Yonca Kuru Otu",
+    "corn silage": "Mısır Silajı",
+    "meadow hay": "Çayır Otu",
+    "straw": "Buğday Samanı",
+}
+
+# Physically sensible ranges for LLM-supplied constraints (DM basis).
+NUTRIENT_BOUNDS = {
+    "crude_protein": (6.0, 30.0),           # % DM
+    "metabolizable_energy": (1.5, 3.5),     # Mcal/kg DM
+    "net_energy_lactation": (0.9, 2.0),     # Mcal/kg DM
+    "calcium": (1.0, 15.0),                 # g/kg DM
+    "phosphorus": (1.0, 10.0),              # g/kg DM
+    "dry_matter": (20.0, 100.0),            # % as-fed
+}
+# Constraint key the LLM uses -> NutrientConstraints field prefix.
+_CONSTRAINT_FIELDS = {
+    "crude_protein": "crude_protein",
+    "metabolizable_energy": "metabolic_energy",
+    "net_energy_lactation": "net_energy_lactation",
+    "calcium": "calcium",
+    "phosphorus": "phosphorus",
+    "dry_matter": "dry_matter",
+}
+
+ToolResult = Tuple[str, Optional[Dict[str, Any]]]
+
+
 class AgentState(TypedDict):
     messages: List[HumanMessage | AIMessage]
     context: Dict[str, Any]
 
 
-# Tool 1: Search knowledge base
-@tool
-def search_knowledge_base(query: str) -> str:
-    """
-    Search the RationAI knowledge base for relevant information about animal nutrition,
-    feed ingredients, nutritional requirements, and feed formulation.
-
-    Args:
-        query: The search query string
-
-    Returns:
-        A string containing relevant information from the knowledge base
-    """
+def _to_float(value: Any) -> Optional[float]:
+    """Coerce to float; None when missing, unparsable or NaN."""
     try:
-        results = query_documents(query_text=query, n_results=3)
-        if results:
-            return "\n\n".join(results)
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if result != result else result
+
+
+def parse_constraints(raw: Any, expected_dm_intake_kg: Optional[float] = None) -> NutrientConstraints:
+    """Turn the LLM's nested constraint JSON into clamped NutrientConstraints.
+
+    Accepts ``{"crude_protein": {"min": 16, "max": 18}, ..., "daily_intake_kg": 22}``
+    as a dict or JSON string. Unparsable values are dropped, bounds are clamped to
+    `NUTRIENT_BOUNDS`, and inverted min/max are swapped instead of discarded.
+    Without an intake in the JSON, `expected_dm_intake_kg` is used (None stays None).
+    """
+    data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    values: Dict[str, Optional[float]] = {}
+
+    for key, (lo, hi) in NUTRIENT_BOUNDS.items():
+        bounds = data.get(key)
+        if isinstance(bounds, dict):
+            low, high = _to_float(bounds.get("min")), _to_float(bounds.get("max"))
         else:
-            return "No relevant information found in the knowledge base."
-    except Exception as e:
-        return f"Error searching knowledge base: {str(e)}"
+            low, high = _to_float(bounds), None  # a bare scalar is read as a minimum
+        low = None if low is None else max(lo, min(hi, low))
+        high = None if high is None else max(lo, min(hi, high))
+        if low is not None and high is not None and low > high:
+            low, high = high, low
+        field = _CONSTRAINT_FIELDS[key]
+        values[f"{field}_min"], values[f"{field}_max"] = low, high
+
+    intake = _to_float(data.get("daily_intake_kg"))
+    if intake is None:
+        intake = expected_dm_intake_kg
+    values["daily_intake_kg"] = None if intake is None else max(0.5, min(60.0, intake))
+    return NutrientConstraints(**values)
 
 
-# Tool 2: Get feed data from database
-@tool
-def get_feed_data() -> str:
-    """
-    Retrieve available feed ingredients and their nutritional composition from the database.
-
-    Returns:
-        A string containing feed information
-    """
-    try:
-        # Get a database session
-        db_gen = get_db()
-        db = next(db_gen)
-
-        try:
-            feeds = db.query(Feed).all()
-            if not feeds:
-                return "No feed data found in database."
-
-            # Format the feed data
-            feed_info = ["Available Feed Ingredients:"]
-            for feed in feeds:
-                feed_info.append(
-                    f"- {feed.name}: "
-                    f"Price: {feed.price_per_kg}/kg, "
-                    f"Dry Matter: {feed.dry_matter}%, "
-                    f"Crude Protein: {feed.crude_protein}%, "
-                    f"Metabolizable Energy: {feed.metabolic_energy} Mcal/kg DM, "
-                    f"Calcium: {feed.calcium} g/kg DM, "
-                    f"Phosphorus: {feed.phosphorus} g/kg DM"
-                )
-
-            return "\n".join(feed_info)
-        finally:
-            db.close()
-    except Exception as e:
-        return f"Error retrieving feed data: {str(e)}"
+def _match_feed_names(requested: List[str], all_names: List[str]) -> List[str]:
+    """Map LLM feed names onto database names: exact, English alias, then substring."""
+    by_lower = {name.lower(): name for name in all_names}
+    by_lower.update({en: tr for en, tr in _ENGLISH_FEED_NAMES.items() if tr in all_names})
+    matched: List[str] = []
+    for name in requested:
+        key = name.lower()
+        hit = by_lower.get(key) or next(
+            (canonical for lower, canonical in by_lower.items() if key in lower or lower in key), None
+        )
+        if hit and hit not in matched:
+            matched.append(hit)
+    return matched
 
 
-# Tool 3: Calculate optimal ration (enhanced version)
-@tool
-def calculate_optimal_ration_enhanced(
-    feed_names: str,
-    constraints: str,
-    animal_weight: float = 600.0,
+# ============================================================
+# Tools — each returns (text for the user, structured optimization result or None)
+# ============================================================
+
+def search_knowledge_base(query: str) -> ToolResult:
+    results = query_documents(query_text=query, n_results=3)
+    return ("\n\n".join(results) if results else "Bilgi tabanında ilgili bilgi bulunamadı."), None
+
+
+def get_feed_data() -> ToolResult:
+    with SessionLocal() as db:
+        feeds = db.query(Feed).order_by(Feed.feed_type, Feed.name).all()
+    if not feeds:
+        return "Veritabanında yem verisi yok.", None
+    lines = ["Mevcut yemler (besin değerleri KM bazında):"] + [
+        f"- {f.name} [{f.feed_type}]: {f.price_per_kg} TL/kg, KM %{f.dry_matter}, "
+        f"HP %{f.crude_protein}, NEL {f.net_energy_lactation} Mcal/kg, "
+        f"ME {f.metabolic_energy} Mcal/kg, NDF %{f.ndf}, "
+        f"Ca {f.calcium} g/kg, P {f.phosphorus} g/kg"
+        for f in feeds
+    ]
+    return "\n".join(lines), None
+
+
+def calculate_ration(
+    feed_names: str = "",
+    constraints: Any = None,
+    animal_weight: float = 650.0,
+    milk_yield: float = 30.0,
+    group: str = "lactating",
+    days_in_milk: int = 120,
+    fat_pct: float = 3.8,
+    days_pregnant: int = 0,
+    first_lactation: bool = False,
     force_use_all_feeds: bool = True,
-    min_inclusion_pct_dm: float = 3.0
-) -> str:
+    min_inclusion_pct_dm: float = 3.0,
+) -> ToolResult:
+    """Run the same two-phase optimizer the /optimize endpoint uses.
+
+    Targets come from the NASEM 2021 requirements of the described animal; `constraints`
+    only overrides the keys the user stated explicitly. With no (matching) feed names,
+    every feed is a candidate and none is forced in.
     """
-    Calculate the optimal feed ration: meet the nutrient targets first, then minimise cost.
+    group = group if group in RULES_BY_GROUP else "lactating"
+    profile = AnimalProfile(
+        group=group,
+        body_weight_kg=float(animal_weight),
+        milk_kg=float(milk_yield or 0.0),
+        fat_pct=float(fat_pct),
+        days_in_milk=max(1, int(days_in_milk)),
+        multiparous=not bool(first_lactation),
+        days_pregnant=max(0, int(days_pregnant)),
+    )
+    req = compute_requirements(profile)
+    explicit = parse_constraints(constraints)
+    target = requirements_to_constraints(req)
+    for name, value in vars(explicit).items():
+        if value is not None:
+            setattr(target, name, value)
+    requested = [n.strip() for n in str(feed_names).split(",") if n.strip()]
 
-    IMPORTANT: list EVERY feed the user named in `feed_names`. Never drop one to make
-    the ration cheaper - the solver decides the amounts, you only pass the candidates.
+    with SessionLocal() as db:
+        all_feeds = db.query(Feed).all()
+        names = _match_feed_names(requested, [f.name for f in all_feeds])
+        if names:
+            selected = [f for f in all_feeds if f.name in names]
+            if not any(f.feed_type in ("mineral", "salt") for f in selected):
+                selected += [f for f in all_feeds if f.name in DEFAULT_MINERALS]
+        else:
+            logger.info("Yem eşleşmesi yok (%s), tüm yemler aday", requested)
+            selected, force_use_all_feeds = all_feeds, False
+        feed_inputs = feeds_from_db(selected)
 
-    Args:
-        feed_names: Comma-separated list of feed ingredient names to consider (e.g., "Mısır,Soya Küspesi,Buğday,Yulaf,Mısır Silajı,Yonca Kuru Otu")
-        constraints: JSON string containing nutrient constraints (see format below)
-        animal_weight: Animal body weight in kg (default 600 kg). Used to estimate daily intake if not provided in constraints.
-        force_use_all_feeds: Keep True (default) so every listed feed enters the ration. Only set False if the user explicitly asks for the cheapest subset.
-        min_inclusion_pct_dm: Target minimum share per feed (default 3.0% DM). Automatically reduced for minerals.
-
-    Format for constraints (all values on DM basis):
-    {
-        "crude_protein": {"min": 16.0, "max": 18.0},   // % DM
-        "metabolizable_energy": {"min": 2.5, "max": 3.0},  // Mcal/kg DM
-        "calcium": {"min": 6.0, "max": 10.0},          // g/kg DM  (= % x 10!)
-        "phosphorus": {"min": 3.5, "max": 5.0},        // g/kg DM  (= % x 10!)
-        "dry_matter": {"min": 40.0, "max": 60.0},      // % as-fed; OMIT when silage is used
-        "daily_intake_kg": 22.0  // optional, auto-calculated from animal_weight if omitted
-    }
-
-    Returns:
-        A string containing the optimization results
-    """
-    try:
-        # Parse inputs - support both Turkish and English feed names
-        feed_name_list = [name.strip() for name in feed_names.split(",") if name.strip()]
-        constraints_dict = json.loads(constraints)
-
-        # Auto-calculate daily intake from animal weight if not provided
-        # Typical dairy cow DMI = 3.7% BW (kg DM/day). This constraint is DM BASIS.
-        if constraints_dict.get("daily_intake_kg") is None:
-            dm_intake_kg = animal_weight * 0.037
-            constraints_dict["daily_intake_kg"] = dm_intake_kg  # DM basis (kg DM/day)
-
-        # NOT: Kuru madde aralığı için varsayılan ATANMAZ.
-        # Rasyonun as-fed KM'si tamamen seçilen yemlere bağlıdır (silajlı rasyon ~%35,
-        # tamamen kuru rasyon ~%88). Sabit bir aralık dayatmak, kullanıcı istemediği
-        # halde yem seçimini kısıtlar ve modeli gereksiz yere gevşetmeye zorlar.
-        # Kullanıcı açıkça belirtirse constraints içinde gelir ve uygulanır.
-
-        # Get feed data from database - use case-insensitive matching
-        db_gen = get_db()
-        db = next(db_gen)
-
-        try:
-            # Build a query that matches feeds case-insensitively
-            from sqlalchemy import or_
-            from sqlalchemy.orm import joinedload
-
-            # First get all feeds to build a name map for fuzzy matching
-            all_feeds = db.query(Feed).all()
-
-            # Create a normalized name map for fuzzy matching
-            name_map = {}
-            for feed in all_feeds:
-                name_map[feed.name.lower()] = feed.name
-                # Also add common English translations
-                english_map = {
-                    'mısır': 'corn',
-                    'buğday': 'wheat',
-                    'arpa': 'barley',
-                    'yulaf': 'oats',
-                    'soya küspesi': 'soybean meal',
-                    'soya-fullfat': 'full-fat soybean',
-                    'mısır gluten yemi': 'corn gluten feed',
-                    'mısır kepeği': 'corn bran',
-                    'buğday kepeği': 'wheat bran',
-                    'yonca kuru otu': 'alfalfa hay',
-                    'mısır silajı': 'corn silage',
-                    'çayır otu': 'meadow hay',
-                    'saman': 'straw',
-                }
-                turkish_lower = feed.name.lower()
-                if turkish_lower in english_map:
-                    name_map[english_map[turkish_lower]] = feed.name
-
-            # Find matching feeds
-            matched_feeds = []
-            for requested_name in feed_name_list:
-                req_lower = requested_name.lower()
-                if req_lower in name_map:
-                    matched_feeds.append(name_map[req_lower])
-                else:
-                    # Try partial matching
-                    for db_name, canonical_name in name_map.items():
-                        if req_lower in db_name or db_name in req_lower:
-                            matched_feeds.append(canonical_name)
-                            break
-
-            # Fallback: if no matches found, use ALL available feeds (robust default)
-            if not matched_feeds:
-                logger.info("Yem eşleşmesi yok (%s), tüm yemlere düşülüyor", feed_name_list)
-                matched_feeds = [f.name for f in all_feeds]
-
-            feeds_db = db.query(Feed).filter(Feed.name.in_(matched_feeds)).all()
-
-            # Convert to FeedIngredient objects using proper DM-basis conversion
-            feed_inputs = feeds_from_db(feeds_db)
-
-            if not feed_inputs:
-                return f"Hata: Seçilen yemler için besin değeri hesaplanamadı."
-
-            # Convert feed_inputs to dict format for validation
-            feeds_for_validation = [f.to_dict() for f in feed_inputs]
-
-            # SANITIZE: Apply validation guardrails to constraints before passing to solver
-            constraints_dict = {
-                "crude_protein": {"min": constraints_dict.get("crude_protein", {}).get("min"),
-                                  "max": constraints_dict.get("crude_protein", {}).get("max")},
-                "metabolizable_energy": {"min": constraints_dict.get("metabolizable_energy", {}).get("min"),
-                                          "max": constraints_dict.get("metabolizable_energy", {}).get("max")},
-                "calcium": {"min": constraints_dict.get("calcium", {}).get("min"),
-                            "max": constraints_dict.get("calcium", {}).get("max")},
-                "phosphorus": {"min": constraints_dict.get("phosphorus", {}).get("min"),
-                               "max": constraints_dict.get("phosphorus", {}).get("max")},
-                "dry_matter": {"min": constraints_dict.get("dry_matter", {}).get("min"),
-                               "max": constraints_dict.get("dry_matter", {}).get("max")},
-                "daily_intake_kg": constraints_dict.get("daily_intake_kg")
-            }
-
-            # Calculate expected DM intake from animal_weight for normalization
-            expected_dm_intake = animal_weight * 0.037
-
-            # Apply sanitization (clamps to physical bounds for dairy cattle)
-            sanitized_constraints = sanitize_nutrient_constraints(
-                constraints_dict, expected_daily_intake_kg=expected_dm_intake
-            )
-
-            # Validate feasibility against available feeds
-            feasibility = validate_ration_feasibility(feeds_for_validation, sanitized_constraints)
-
-            nutrient_constraints = NutrientConstraints(
-                crude_protein_min=sanitized_constraints.get("crude_protein", {}).get("min"),
-                crude_protein_max=sanitized_constraints.get("crude_protein", {}).get("max"),
-                metabolic_energy_min=sanitized_constraints.get("metabolizable_energy", {}).get("min"),
-                metabolic_energy_max=sanitized_constraints.get("metabolizable_energy", {}).get("max"),
-                calcium_min=sanitized_constraints.get("calcium", {}).get("min"),
-                calcium_max=sanitized_constraints.get("calcium", {}).get("max"),
-                phosphorus_min=sanitized_constraints.get("phosphorus", {}).get("min"),
-                phosphorus_max=sanitized_constraints.get("phosphorus", {}).get("max"),
-                dry_matter_min=sanitized_constraints.get("dry_matter", {}).get("min"),
-                dry_matter_max=sanitized_constraints.get("dry_matter", {}).get("max"),
-                daily_intake_kg=sanitized_constraints.get("daily_intake_kg")
-            )
-
-            # Solve: nutrition-first two-phase optimization
-            max_asfed_intake = (animal_weight * 0.05) / 0.35
-            result: OptimizationResult = optimize_ration(
-                feed_inputs,
-                nutrient_constraints,
-                use_all_selected=force_use_all_feeds,
-                min_inclusion_pct_dm=min_inclusion_pct_dm,
-                expected_daily_intake_kg=expected_dm_intake,
-                max_daily_intake_kg=max_asfed_intake
-            )
-
-            # Add feasibility warnings to adjustments if any
-            if not feasibility["feasible"]:
-                result.adjustments.extend(feasibility["warnings"])
-
-            # Convert to structured schema for the API response
-            structured_result = optimization_result_to_schema(result, feed_inputs)
-
-            # Store structured result in context for the API to return
-            # Note: We can't directly access state from here, but we'll return a marker
-            # and the response will be built from the structured data
-
-            # Format the results for the LLM
-            output = [
-                "=== RATION OPTIMIZATION RESULT ===",
-                f"Status: {result.status}",
-                f"Total Daily Cost: {result.total_cost_per_day:.2f} TL/gün",
-                f"Ration Cost: {result.total_cost_per_kg:.2f} TL/kg",
-                f"Daily Intake: {result.total_daily_intake_kg:.2f} kg/gün (doğal hali)",
-                "",
-                "YEM ÖNERİLERİ (kg/gün):"
-            ]
-
-            for feed_name, amount in sorted(result.feed_amounts.items(), key=lambda x: -x[1]):
-                if amount > 0.001:
-                    pct = result.feed_proportions.get(feed_name, 0) * 100
-                    output.append(f"  - {feed_name}: {amount:.3f} kg/gün ({pct:.1f}%)")
-
-            output.append("")
-            output.append("RASYON BESİN DEĞERİ (KM Bazında):")
-            output.append(f"  - Ham Protein: {result.nutrient_content.get('crude_protein_percent_dm', 0):.2f}% KM")
-            output.append(f"  - Met. Enerji: {result.nutrient_content.get('metabolic_energy_mcal_per_kg_dm', 0):.3f} Mcal/kg KM")
-            output.append(f"  - Kalsiyum: {result.nutrient_content.get('calcium_g_per_kg_dm', 0):.2f} g/kg KM")
-            output.append(f"  - Fosfor: {result.nutrient_content.get('phosphorus_g_per_kg_dm', 0):.2f} g/kg KM")
-            output.append(f"  - Kuru Madde: {result.nutrient_content.get('dry_matter_percent', 0):.1f}% (doğal hali)")
-            ca_p = result.nutrient_content.get('ca_p_ratio', 0)
-            if ca_p:
-                output.append(f"  - Ca:P Oranı: {ca_p:.2f}")
-
-            if result.constraints_status:
-                output.append("")
-                output.append("KISITLAMA DURUMU:")
-                for constraint, status in result.constraints_status.items():
-                    icon = "✓" if status == "OK" else "⚠"
-                    output.append(f"  {icon} {constraint}: {status}")
-
-            if result.adjustments:
-                output.append("")
-                output.append("TÜRKÇE AÇIKLAMALAR:")
-                for adj in result.adjustments:
-                    output.append(f"  - {adj}")
-
-            if result.warnings:
-                output.append("")
-                output.append("UYARILAR:")
-                for w in result.warnings:
-                    output.append(f"  - {w}")
-
-            # Return formatted string with structured data marker
-            # The tool executor will extract the structured result
-            return "\n".join(output) + f"\n\n__STRUCTURED_RESULT__:{json.dumps(structured_result.model_dump())}"
-
-        finally:
-            db.close()
-
-    except Exception as e:
-        logger.exception("calculate_optimal_ration_enhanced başarısız")
-        return f"Hata: Optimizasyon hesaplanamadı - {str(e)}"
+    rules = RULES_BY_GROUP[group]
+    result = optimize_ration(
+        feed_inputs,
+        target,
+        use_all_selected=bool(force_use_all_feeds),
+        min_inclusion_pct_dm=float(min_inclusion_pct_dm),
+        expected_daily_intake_kg=target.daily_intake_kg,
+        max_daily_intake_kg=(profile.body_weight_kg * 0.05) / 0.35,
+        body_weight_kg=profile.body_weight_kg,
+        rules=rules,
+    )
+    result.adjustments = [
+        f"🐄 {rules.label}, {profile.body_weight_kg:.0f} kg"
+        + (f", {profile.milk_kg:.0f} kg süt, laktasyonun {profile.days_in_milk}. günü"
+           if group == "lactating" else "")
+        + f": KMT {req.dm_intake_kg} kg, NEL {req.nel_min}-{req.nel_max} Mcal/kg KM, "
+          f"HP %{target.crude_protein_min}-{target.crude_protein_max} (NASEM 2021)."
+    ] + [f"ℹ️ {note}" for note in req.notes] + result.adjustments
+    structured = optimization_result_to_schema(result, feed_inputs).model_dump()
+    return format_result_for_agent(result), structured
 
 
-# Tool 4: Simple ration calculator (backward compatibility)
-@tool
-def calculate_simple_ration(
-    animal_weight: str,
-    target_protein_kg: str = "",
-    target_energy_mcal: str = ""
-) -> str:
-    """
-    Calculate a simple ration based on animal weight (enhanced with soft constraints).
-
-    Args:
-        animal_weight: Animal weight in kg (as string)
-        target_protein_kg: Required crude protein in kg (optional, as string)
-        target_energy_mcal: Required metabolizable energy in Mcal (optional, as string)
-
-    Returns:
-        A string containing the optimization results with structured data
-    """
-    try:
-        # Convert inputs
-        weight = float(animal_weight)
-        protein = float(target_protein_kg) if target_protein_kg.strip() else None
-        energy = float(target_energy_mcal) if target_energy_mcal.strip() else None
-
-        # Get database session
-        db_gen = get_db()
-        db = next(db_gen)
-
-        try:
-            # Get all feeds from database and convert properly
-            feeds_db = db.query(Feed).all()
-            if not feeds_db:
-                return "Hata: Veritabanında yem verisi bulunamadı."
-
-            # Convert using proper DM-basis conversion
-            feed_inputs = feeds_from_db(feeds_db)
-
-            # Estimate daily intake (~3.7% BW for dairy cows) - DM BASIS
-            expected_dm_intake = weight * 0.037
-            # Max as-fed intake safety: assume min 35% DM in ration, so max as-fed = DM_intake / 0.35
-            max_asfed_intake = (weight * 0.05) / 0.35  # 5% BW DM intake / 0.35 = ~14% BW as-fed
-
-            # Build constraints - use simple defaults if not provided
-            if protein is None:
-                # Rough estimate: ~1.8 kg CP/day for 600kg cow
-                protein = weight * 0.003
-            if energy is None:
-                # Rough estimate: ~35 Mcal ME/day for 600kg cow
-                energy = weight * 0.035 + 5.0
-
-            # The tool takes DAILY totals (kg CP/day, Mcal ME/day) but the solver works on a
-            # DM-concentration basis, so divide by the expected daily DM intake.
-            protein_pct_dm = (protein / expected_dm_intake) * 100.0
-            energy_mcal_per_kg_dm = energy / expected_dm_intake
-
-            # Convert feed_inputs to dict for validation
-            feeds_for_validation = [f.to_dict() for f in feed_inputs]
-
-            # SANITIZE: Apply validation guardrails
-            constraints_dict = {
-                "crude_protein": {"min": protein_pct_dm, "max": None},
-                "metabolizable_energy": {"min": energy_mcal_per_kg_dm, "max": None},
-                "daily_intake_kg": expected_dm_intake
-            }
-
-            from .schemas import sanitize_nutrient_constraints, validate_ration_feasibility
-            sanitized_constraints = sanitize_nutrient_constraints(constraints_dict, expected_daily_intake_kg=expected_dm_intake)
-
-            # Validate feasibility
-            feasibility = validate_ration_feasibility(feeds_for_validation, sanitized_constraints)
-
-            constraints = NutrientConstraints(
-                crude_protein_min=sanitized_constraints.get("crude_protein", {}).get("min"),
-                crude_protein_max=sanitized_constraints.get("crude_protein", {}).get("max"),
-                metabolic_energy_min=sanitized_constraints.get("metabolizable_energy", {}).get("min"),
-                metabolic_energy_max=sanitized_constraints.get("metabolizable_energy", {}).get("max"),
-                dry_matter_min=sanitized_constraints.get("dry_matter", {}).get("min"),
-                dry_matter_max=sanitized_constraints.get("dry_matter", {}).get("max"),
-                daily_intake_kg=sanitized_constraints.get("daily_intake_kg")
-            )
-
-            # Solve: nutrition-first two-phase optimization.
-            # This tool considers the WHOLE feed database, so feeds are not forced in -
-            # the solver picks the cheapest combination that meets the targets.
-            result: OptimizationResult = optimize_ration(
-                feed_inputs,
-                constraints,
-                use_all_selected=False,
-                expected_daily_intake_kg=expected_dm_intake,
-                max_daily_intake_kg=max_asfed_intake
-            )
-
-            # Add feasibility warnings to adjustments if any
-            if not feasibility["feasible"]:
-                result.adjustments.extend(feasibility["warnings"])
-
-            # Convert to structured schema
-            structured_result = optimization_result_to_schema(result, feed_inputs)
-
-            # Format text output for LLM
-            output = [
-                "=== BASİT RASYON HESAPLAMA SONUCU ===",
-                f"Hayvan Ağırlığı: {weight} kg",
-                f"Durum: {result.status}",
-                f"Toplam Günlük Maliyet: {result.total_cost_per_day:.2f} TL/gün",
-                f"Rasyon Maliyeti: {result.total_cost_per_kg:.2f} TL/kg",
-                f"Günlük Tüketim: {result.total_daily_intake_kg:.2f} kg/gün (doğal hali)",
-                "",
-                "YEM ÖNERİLERİ (kg/gün):"
-            ]
-
-            for feed_name, amount in sorted(result.feed_amounts.items(), key=lambda x: -x[1]):
-                if amount > 0.001:
-                    pct = result.feed_proportions.get(feed_name, 0) * 100
-                    output.append(f"  - {feed_name}: {amount:.3f} kg/gün ({pct:.1f}%)")
-
-            output.append("")
-            output.append("RASYON BESİN DEĞERİ (KM Bazında):")
-            output.append(f"  - Ham Protein: {result.nutrient_content.get('crude_protein_percent_dm', 0):.2f}% KM")
-            output.append(f"  - Met. Enerji: {result.nutrient_content.get('metabolic_energy_mcal_per_kg_dm', 0):.3f} Mcal/kg KM")
-            output.append(f"  - Kalsiyum: {result.nutrient_content.get('calcium_g_per_kg_dm', 0):.2f} g/kg KM")
-            output.append(f"  - Fosfor: {result.nutrient_content.get('phosphorus_g_per_kg_dm', 0):.2f} g/kg KM")
-            output.append(f"  - Kuru Madde: {result.nutrient_content.get('dry_matter_percent', 0):.1f}% (doğal hali)")
-
-            if result.adjustments:
-                output.append("")
-                output.append("TÜRKÇE AÇIKLAMALAR:")
-                for adj in result.adjustments:
-                    output.append(f"  - {adj}")
-
-            # Return with structured data marker
-            return "\n".join(output) + f"\n\n__STRUCTURED_RESULT__:{json.dumps(structured_result.model_dump())}"
-
-        finally:
-            db.close()
-
-    except Exception as e:
-        logger.exception("calculate_simple_ration başarısız")
-        return f"Hata: Basit rasyon hesaplanamadı - {str(e)}"
+TOOLS = {
+    "search_knowledge_base": search_knowledge_base,
+    "get_feed_data": get_feed_data,
+    "calculate_ration": calculate_ration,
+}
 
 
 # ============================================================
@@ -492,7 +245,9 @@ def calculate_simple_ration(
 # /api/v1/agent/query must keep working without a key.
 # ============================================================
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Groq retires models without much notice (llama-3.3-70b-versatile started answering
+# 404 model_not_found), so the model is overridable without a code change.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b"
 
 _llm: Optional[ChatGroq] = None
 
@@ -503,11 +258,7 @@ def llm_available() -> bool:
 
 
 def _get_llm() -> ChatGroq:
-    """Return the shared ChatGroq client, building it on first use.
-
-    Raises:
-        RuntimeError: when GROQ_API_KEY is unset — callers turn this into HTTP 503.
-    """
+    """Return the shared ChatGroq client, building it on first use."""
     global _llm
     if _llm is None:
         if not llm_available():
@@ -520,325 +271,170 @@ def _get_llm() -> ChatGroq:
     return _llm
 
 
-# Agent node: uses LLM to decide which tool to call and extract parameters
-def agent_node(state: AgentState):
-    """
-    Main agent node that uses the LLM to reason about the user query,
-    decide which tool to use, and extract its arguments.
-    If no tool is needed, the LLM provides a direct answer.
-    """
-    messages = state["messages"]
-    # The last message is the user's query (HumanMessage)
-    user_query = messages[-1].content if isinstance(messages[-1], HumanMessage) else ""
+SYSTEM_PROMPT = """You are RationAI, a dairy-cow nutrition assistant. Answer in the user's language.
+You can call one of these tools:
 
-    # Build a system message that instructs the LLM how to use tools
-    system_prompt = """You are an AI assistant that helps with animal nutrition questions. You have access to the following tools:
+1. search_knowledge_base
+   - args: query (string)
+   - Searches the nutrition reference documents.
 
-1. search_knowledge_base:
-   - Description: Search the RationAI knowledge base for relevant information about animal nutrition, feed ingredients, nutritional requirements, and feed formulation.
-   - Parameters:
-     - query (string): The search query string
-   - Returns: Relevant knowledge base snippets
+2. get_feed_data
+   - args: none
+   - Lists every feed with price and nutrient values.
 
-2. get_feed_data:
-   - Description: Retrieve available feed ingredients and their nutritional composition from the database.
-   - Parameters: None
-   - Returns: List of feed ingredients with price, dry matter, crude protein, metabolizable energy, calcium, phosphorus
+3. calculate_ration
+   - Nutrition-first optimizer: it meets the nutrient targets first and minimises cost
+     only among rations that satisfy them.
+   - args:
+     - feed_names (string): comma-separated feed names, exactly as in the list below.
+       List EVERY feed the user mentioned — never leave one out to make it cheaper; the
+       solver decides the amounts. Leave empty to let it choose from all feeds.
+       Minerals are added automatically when none is listed.
+     - Describe the ANIMAL; the tool computes the nutrient targets itself (NASEM 2021).
+       Do NOT invent nutrient targets.
+       - animal_weight (number, kg, default 650)
+       - milk_yield (number, kg milk/day, default 30; a "litre" is ~1 kg)
+       - group: "lactating" (default), "dry_faroff" (dry, >3 weeks before calving)
+         or "dry_closeup" (last ~3 weeks before calving)
+       - days_in_milk (int, default 120), fat_pct (default 3.8),
+         days_pregnant (int, 0 = not pregnant), first_lactation (bool, default false)
+     - constraints (JSON object) — ONLY targets the user stated explicitly; they override
+       the computed ones. DM basis, every key optional:
+         "crude_protein": {{"min": 16, "max": 18}}          % DM
+         "net_energy_lactation": {{"min": 1.6, "max": 1.8}} Mcal NEL/kg DM
+         "calcium": {{"min": 6, "max": 10}}                  g/kg DM = % x 10
+         "phosphorus": {{"min": 3.5, "max": 5}}              g/kg DM = % x 10
+         "daily_intake_kg": 22                             kg DM/day
+       Do NOT send "dry_matter" unless the user explicitly asks: a silage ration sits
+       near 35 % DM and a wrong range makes every target unreachable.
+     - force_use_all_feeds (bool, default true) — false only if the user wants the
+       cheapest subset.
 
-3. calculate_optimal_ration_enhanced:
-   - Description: Nutrition-first ration optimizer. It meets the nutrient targets FIRST and
-     minimises cost only among rations that satisfy them.
-   - Parameters:
-     - feed_names (string): Comma-separated list of feed ingredient names to consider (e.g., "Mısır,Soya Küspesi,Buğday,Yulaf,Mısır Silajı,Yonca Kuru Otu"). Use Turkish feed names from get_feed_data.
-       ⚠️ List EVERY feed the user mentioned. Never leave one out to make the ration cheaper -
-       the solver decides the amounts; your job is only to pass the candidate list.
-     - constraints (string): JSON string containing nutrient constraints with min/max values (all on DM basis):
-        * crude_protein (%) - typical dairy: 16-18%
-        * metabolizable_energy (Mcal/kg) - typical dairy: 2.5-2.8
-        * calcium (g/kg DM) - typical dairy: 6-10. This is TEN TIMES the percentage (0.6% = 6 g/kg).
-        * phosphorus (g/kg DM) - typical dairy: 3.5-5. Also ten times the percentage.
-        * dry_matter (%) - OMIT THIS unless the user explicitly asks. It depends entirely on
-          which feeds are chosen (silage ration ~35%, all-dry ration ~88%) and a wrong
-          value makes the targets unreachable.
-        * daily_intake_kg (optional, kg DM/day) - auto-calculated from animal_weight if omitted
-     - animal_weight (float, optional): Animal body weight in kg (default 600). Used to auto-estimate daily intake if not in constraints.
-     - force_use_all_feeds (bool, optional): defaults to true - keep it that way so every
-       listed feed enters the ration.
-   - Returns: Optimal ration formulation with feed amounts, nutrient content, total cost, and constraint status
+Feeds in the database (Turkish names, grouped by type):
+{feed_list}
 
-4. calculate_simple_ration:
-   - Description: Calculate a simple ration based on animal weight (backward compatible).
-   - Parameters:
-     - animal_weight (string): Animal weight in kg
-     - target_protein_kg (string, optional): Required crude protein in kg
-     - target_energy_mcal (string, optional): Required metabolizable energy in Mcal
-   - Returns: Simple ration formulation
-
-Based on the user's question, decide which tool to use and provide the arguments. If you can answer directly without tools, respond with a plain answer.
-
-IMPORTANT: Feed names in our database are in Turkish. Examples:
-- Mısır (Corn)
-- Buğday (Wheat)
-- Arpa (Barley)
-- Yulaf (Oats)
-- Soya Küspesi (Soybean Meal)
-- Soya-Fullfat (Full-fat Soybean)
-- Mısır Gluten Yemi (Corn Gluten Feed)
-- Mısır Kepeği (Corn Bran)
-- Buğday Kekeği (Wheat Bran)
-- DDGS (DDGS)
-- Yonca Kuru Otu (Alfalfa Hay)
-- Mısır Silajı (Corn Silage)
-- Çayır Otu (Meadow Hay)
-- Saman (Straw)
-
-For TMR rations with silage: use dry_matter range 40-60% (not 85-90%).
-For daily intake: if you provide animal_weight, the tool auto-calculates it (~22 kg DM/day for 600 kg cow = ~44 kg as-fed).
-
-You MUST respond with a valid JSON object exactly matching one of these formats:
-
-If using a tool:
-{
-  "tool": "tool_name_exact",
-  "args": {
-    "param1": "value1",
-    "param2": "value2"
-  }
-}
-
-If not using a tool (direct answer):
-{
-  "answer": "your answer here"
-}
-
-Do not include any extra text outside the JSON. Be precise with parameter names and types.
+Respond with ONLY a JSON object, no other text:
+- To call a tool: {{"tool": "<tool name>", "args": {{...}}}}
+- To answer directly: {{"answer": "<your answer>"}}
 """
 
-    # Prepare messages for LLM: system + conversation history (we only need the latest user query for simplicity)
-    # We'll include the system prompt and the user query.
-    lc_messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_query)]
 
-    # Invoke the LLM
-    ai_msg: AIMessage = _get_llm().invoke(lc_messages)
+def _feed_list_for_prompt() -> str:
+    with SessionLocal() as db:
+        rows = db.query(Feed.feed_type, Feed.name).order_by(Feed.feed_type, Feed.name).all()
+    groups: Dict[str, List[str]] = {}
+    for feed_type, name in rows:
+        groups.setdefault(feed_type or "unknown", []).append(name)
+    return "\n".join(f"- {ftype}: {', '.join(names)}" for ftype, names in groups.items())
 
-    # Try to parse the response as JSON
-    response_text = ai_msg.content.strip()
-    tool_name = None
-    tool_args = {}
-    direct_answer = None
 
-    # Attempt to extract JSON from the response (in case the LLM adds extra text)
-    json_match = re.search(r'\{[\s\S]*\}', response_text)
-    if json_match:
-        json_str = json_match.group(0)
+def _parse_llm_reply(text: str) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+    """Return (tool_name, tool_args, direct_answer) from the LLM's JSON reply."""
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
         try:
-            data = json.loads(json_str)
-            if "tool" in data and "args" in data:
-                tool_name = data["tool"]
-                tool_args = data.get("args", {})
-            elif "answer" in data:
-                direct_answer = data["answer"]
-            else:
-                # If we can't determine, treat as direct answer
-                direct_answer = response_text
+            data = json.loads(match.group(0))
         except json.JSONDecodeError:
-            # If JSON parsing fails, treat the whole response as direct answer
-            direct_answer = response_text
-    else:
-        # No JSON found, treat as direct answer
-        direct_answer = response_text
+            data = None
+        if isinstance(data, dict):
+            if "tool" in data:
+                return data["tool"], data.get("args") or {}, None
+            if "answer" in data:
+                return None, {}, str(data["answer"])
+    return None, {}, text
 
+
+def agent_node(state: AgentState):
+    """Ask the LLM to either pick a tool (with args) or answer directly."""
+    user_query = state["messages"][-1].content
+    prompt = SYSTEM_PROMPT.format(feed_list=_feed_list_for_prompt())
+    ai_msg: AIMessage = _get_llm().invoke([SystemMessage(content=prompt), HumanMessage(content=user_query)])
+
+    response_text = ai_msg.content.strip()
+    from_reasoning = not response_text
+    if from_reasoning:
+        # gpt-oss sometimes ends its turn inside the reasoning channel, leaving `content`
+        # empty with the JSON reply at the end of `reasoning_content`. Use that JSON — but
+        # never show raw reasoning to the user.
+        reasoning = ai_msg.additional_kwargs.get("reasoning_content", "")
+        start = max(reasoning.rfind('{"tool"'), reasoning.rfind('{"answer"'))
+        response_text = reasoning[start:] if start >= 0 else ""
+    tool_name, tool_args, direct_answer = _parse_llm_reply(response_text)
+    unparsed = direct_answer == response_text  # no JSON envelope was found
+    if tool_name is None and (not direct_answer.strip() or (from_reasoning and unparsed)):
+        direct_answer = "Üzgünüm, bu soruya şu an yanıt üretemedim. Lütfen tekrar deneyin."
     logger.debug("LLM ham yanıtı: %s", response_text)
     logger.debug("tool_name=%s, tool_args=%s", tool_name, tool_args)
 
-    new_context = dict(state.get("context", {}))
-
+    context = dict(state.get("context", {}))
     if tool_name is not None:
         # Keep the raw message: the tool executor appends the readable result after it.
-        new_messages = messages + [ai_msg]
-        new_context["tool_name"] = tool_name
-        new_context["tool_args"] = tool_args
-        new_context["tool_called"] = True
-    else:
-        # No tool needed. Append the EXTRACTED answer, not the raw message: the LLM replies
-        # with a JSON envelope ({"answer": "..."}) and `run_agent` returns the last AIMessage.
-        # Appending `ai_msg` here made users see that raw JSON as the agent's answer.
-        new_messages = messages + [AIMessage(content=direct_answer)]
-        new_context["tool_called"] = False
-        new_context["direct_answer"] = direct_answer
+        context.update(tool_name=tool_name, tool_args=tool_args)
+        return {"messages": state["messages"] + [ai_msg], "context": context}
 
-    return {
-        "messages": new_messages,
-        "context": new_context
-    }
+    # Append the EXTRACTED answer, not the raw message: the LLM replies with a JSON
+    # envelope ({"answer": "..."}) and `run_agent` returns the last AIMessage, so
+    # appending `ai_msg` here made users see that raw JSON as the agent's answer.
+    return {"messages": state["messages"] + [AIMessage(content=direct_answer)], "context": context}
 
 
-# Tool executor node: runs the selected tool
 def tool_executor_node(state: AgentState):
-    """
-    Executes the tool selected by the LLM.
-    """
-    context = state.get("context", {})
-    tool_name = context.get("tool_name")
-    tool_args = context.get("tool_args", {})
+    """Run the tool the LLM picked and append its readable result."""
+    context = dict(state["context"])
+    tool_name = context.pop("tool_name")
+    tool_args = context.pop("tool_args", {})
 
-    # Map tool names to the actual tool functions
-    tools_map = {
-        "search_knowledge_base": search_knowledge_base,
-        "get_feed_data": get_feed_data,
-        "calculate_optimal_ration_enhanced": calculate_optimal_ration_enhanced,
-        "calculate_simple_ration": calculate_simple_ration
-    }
-
-    if tool_name not in tools_map:
-        result = f"Error: Unknown tool '{tool_name}'"
-        structured_result = None
+    tool = TOOLS.get(tool_name)
+    if tool is None:
+        text, structured = f"Bilinmeyen araç: '{tool_name}'", None
     else:
         try:
-            # Invoke the tool with the provided arguments
-            tool_func = tools_map[tool_name]
-            result = tool_func.invoke(tool_args)
+            text, structured = tool(**tool_args)
+        except Exception as exc:
+            logger.exception("Araç %s başarısız (args=%r)", tool_name, tool_args)
+            text, structured = f"Araç çalıştırılamadı ({tool_name}): {exc}", None
 
-            # Extract structured result if present (for optimization tools)
-            if tool_name in ("calculate_optimal_ration_enhanced", "calculate_simple_ration") and isinstance(result, str) and "__STRUCTURED_RESULT__:" in result:
-                try:
-                    parts = result.split("__STRUCTURED_RESULT__:")
-                    clean_result = parts[0]
-                    structured_json = parts[1]
-                    # Validate through the schema, then hand back a plain dict:
-                    # AgentResponse.optimization_result is Dict[str, Any], not a model.
-                    structured_result = OptimizationResponse(
-                        **json.loads(structured_json)
-                    ).model_dump()
-                    result = clean_result  # Keep clean text for LLM
-                except Exception as e:
-                    logger.warning("Yapısal optimizasyon sonucu ayrıştırılamadı: %s", e)
-                    structured_result = None
-            else:
-                structured_result = None
-
-        except Exception as e:
-            result = f"Error executing tool {tool_name}: {str(e)}"
-            structured_result = None
-
-    # Create an AIMessage with the result (as if the agent produced it)
-    ai_message = AIMessage(content=result)
-
-    # Update state: add the tool result message and clear tool-specific context
-    new_messages = state["messages"] + [ai_message]
-    new_context = dict(state["context"])
-    # Remove tool-specific fields to avoid reuse
-    new_context.pop("tool_name", None)
-    new_context.pop("tool_args", None)
-    new_context.pop("tool_called", None)
-    new_context.pop("direct_answer", None)
-    # Store structured optimization result for API response
-    if structured_result:
-        new_context["optimization_result"] = structured_result
-
-    return {
-        "messages": new_messages,
-        "context": new_context
-    }
+    if structured:
+        context["optimization_result"] = structured
+    return {"messages": state["messages"] + [AIMessage(content=text)], "context": context}
 
 
-# Build the graph
 def create_agent_graph():
-    """
-    Create the LangGraph state graph for the agent.
-    """
     workflow = StateGraph(AgentState)
-
-    # Add nodes
     workflow.add_node("agent", agent_node)
     workflow.add_node("tool_executor", tool_executor_node)
-
-    # Set entry point
     workflow.set_entry_point("agent")
-
-    # Add conditional edge: after agent, go to tool_executor if a tool was called, else end
-    def should_continue(state: AgentState) -> str:
-        if state.get("context", {}).get("tool_called"):
-            return "tool_executor"
-        else:
-            return END
-
     workflow.add_conditional_edges(
         "agent",
-        should_continue,
-        {
-            "tool_executor": "tool_executor",
-            END: END
-        }
+        lambda state: "tool_executor" if "tool_name" in state.get("context", {}) else END,
+        {"tool_executor": "tool_executor", END: END},
     )
-
-    # After tool execution, always end
     workflow.add_edge("tool_executor", END)
-
-    # Compile the graph
     return workflow.compile()
 
 
-# Create the agent instance
 agent_graph = create_agent_graph()
 
 
 def run_agent(query: str) -> AgentResponse:
+    """Run the agent on a user query.
+
+    Raises whatever the graph raised, after logging it — the endpoint turns it into
+    HTTP 500 instead of folding a crash into a 200 response.
     """
-    Run the agent on a user query and return a structured response.
-
-    Args:
-        query: The user's question or request
-
-    Returns:
-        AgentResponse with both text response and optional structured optimization data
-
-    Raises:
-        Exception: whatever the graph raised, after logging it — the caller decides
-        how to surface it (the API endpoint turns it into HTTP 500).
-    """
-    # Initialize state
-    initial_state = {
-        "messages": [HumanMessage(content=query)],
-        "context": {}
-    }
-
     try:
-        # Run the agent
-        final_state = agent_graph.invoke(initial_state)
-
-        # Get the last AI message as the text response
-        messages = final_state["messages"]
-        text_response = "I'm sorry, I couldn't process your request."
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage):
-                text_response = msg.content
-                break
-
-        # Extract structured optimization result from context
-        optimization_result = final_state.get("context", {}).get("optimization_result")
-
-        return AgentResponse(
-            success=True,
-            answer=text_response,
-            response=text_response,
-            optimization_result=optimization_result
-        )
+        final_state = agent_graph.invoke({"messages": [HumanMessage(content=query)], "context": {}})
     except Exception:
-        # Deliberately not turned into a success=False AgentResponse: a crash in the
-        # graph is a server error and the endpoint must be able to answer 500 with it.
         logger.exception("run_agent başarısız (query=%r)", query)
         raise
 
-
-# Optional: Function to ingest documents (can be called separately)
-def initialize_knowledge_base():
-    """
-    Initialize the knowledge base by ingesting documents from the data directory.
-    This can be called during application startup.
-    """
-    try:
-        ingest_documents()
-        return "Knowledge base initialized successfully."
-    except Exception as e:
-        return f"Error initializing knowledge base: {str(e)}"
+    text = next(
+        (msg.content for msg in reversed(final_state["messages"]) if isinstance(msg, AIMessage)),
+        "Üzgünüm, isteğinizi işleyemedim.",
+    )
+    return AgentResponse(
+        success=True,
+        answer=text,
+        response=text,
+        optimization_result=final_state.get("context", {}).get("optimization_result"),
+    )

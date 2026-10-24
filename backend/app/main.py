@@ -1,36 +1,45 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-from .database import engine, Base, get_db, sessionmaker, seed_initial_feeds, SessionLocal
-from .schemas import (
-    FeedResponse,
-    OptimizationRequest,
-    OptimizationResponse,
-    AgentResponse,
-    HealthCheckResponse,
-)
-from .rag import ingest_documents, query_documents, get_chroma_client, get_or_create_collection
-from .agent import run_agent, initialize_knowledge_base, llm_available
-from .optimization import (
-    optimize_ration,
-    optimization_result_to_schema,
-    feeds_from_db,
-    NutrientConstraints,
-)
-from .scraper import update_feed_prices
-from pydantic import BaseModel
-from typing import Optional, List
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import List, Optional
+
+from fastapi import Depends, FastAPI, HTTPException
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from .agent import llm_available, run_agent
+from .database import Base, SessionLocal, engine, get_db, seed_initial_feeds
+from .models import Feed
+from .optimization import (
+    LACTATING_RULES,
+    RULES_BY_GROUP,
+    NutrientConstraints,
+    feeds_from_db,
+    optimization_result_to_schema,
+    optimize_ration,
+)
+from .rag import get_chroma_client, get_or_create_collection, ingest_documents, query_documents
+from .requirements import AnimalProfile, compute_requirements, requirements_to_constraints
+from .schemas import (
+    AgentQuery,
+    AgentResponse,
+    AnimalProfileIn,
+    FeedPriceUpdate,
+    FeedResponse,
+    HealthCheckResponse,
+    OptimizationRequest,
+    OptimizationResponse,
+    PriceSyncResponse,
+    RequirementsResponse,
+)
+from .scraper import update_feed_prices
 
 # Uvicorn only configures its own loggers, so without this the backend's module
 # loggers fall back to the WARNING-only "last resort" handler. The level is raised on
 # the `backend` package only — putting it on the root logger would also switch on
-# httpx/urllib3 INFO chatter. LOG_LEVEL=DEBUG brings back the per-request agent
-# tracing that used to be raw prints.
+# httpx/urllib3 INFO chatter. LOG_LEVEL=DEBUG brings back the per-request agent tracing.
 logging.basicConfig(format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger("backend").setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
@@ -50,18 +59,14 @@ def _prepare_database() -> None:
     for attempt in range(1, DB_STARTUP_RETRIES + 1):
         try:
             Base.metadata.create_all(bind=engine)
-            db = SessionLocal()
-            try:
+            with SessionLocal() as db:
                 seed_initial_feeds(db)
-            finally:
-                db.close()
             logger.info("Veritabanı hazır (deneme %d)", attempt)
             return
         except Exception as exc:  # noqa: BLE001 - any driver error means "not ready yet"
             last_error = exc
             logger.warning(
-                "Veritabanına bağlanılamadı (deneme %d/%d): %s",
-                attempt, DB_STARTUP_RETRIES, exc,
+                "Veritabanına bağlanılamadı (deneme %d/%d): %s", attempt, DB_STARTUP_RETRIES, exc
             )
             time.sleep(DB_STARTUP_DELAY_SECONDS)
     raise RuntimeError(f"Veritabanı {DB_STARTUP_RETRIES} denemede hazır olmadı: {last_error}")
@@ -69,7 +74,6 @@ def _prepare_database() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Prepare the database on startup (replaces the deprecated @app.on_event)."""
     _prepare_database()
     yield
 
@@ -118,29 +122,47 @@ def health_check():
 
 @app.get("/api/v1/feeds", response_model=list[FeedResponse])
 def get_feeds(db: Session = Depends(get_db)):
-    seed_initial_feeds(db)
-    from .models import Feed
-    feeds = db.query(Feed).all()
-    return feeds
+    return db.query(Feed).all()
 
 
-# RAG endpoints
 @app.post("/api/v1/rag/ingest")
 def rag_ingest():
-    """
-    Ingest documents from the data/docs directory into the ChromaDB collection.
-    """
-    ingest_documents()
-    return {"status": "Documents ingested successfully"}
+    """Rebuild the knowledge base from data/docs/."""
+    return {"status": "Documents ingested successfully", **ingest_documents()}
 
 
 @app.get("/api/v1/rag/search")
 def rag_search(query: str):
-    """
-    Search for relevant document chunks based on the query string.
-    """
-    results = query_documents(query_text=query)
-    return {"results": results}
+    return {"results": query_documents(query_text=query)}
+
+
+@app.post("/api/v1/requirements", response_model=RequirementsResponse)
+def requirements(animal: AnimalProfileIn):
+    """NASEM 2021 requirements for an animal profile, plus its group's ration rules."""
+    req = compute_requirements(AnimalProfile(**animal.model_dump()))
+    rules = RULES_BY_GROUP[req.group]
+    return RequirementsResponse(
+        group=req.group,
+        group_label=rules.label,
+        dm_intake_kg=req.dm_intake_kg,
+        nel_mcal_day=req.nel_mcal_day,
+        nel_min=req.nel_min,
+        nel_max=req.nel_max,
+        mp_g_day=req.mp_g_day,
+        cp_kg_day=req.cp_kg_day,
+        cp_min=req.cp_min,
+        cp_max=req.cp_max,
+        calcium_min=req.ca_min,
+        calcium_max=req.ca_max,
+        phosphorus_min=req.p_min,
+        phosphorus_max=req.p_max,
+        energy_deficit_mcal=req.energy_deficit_mcal,
+        notes=req.notes,
+        ndf_min=rules.ndf_min,
+        ndf_max=rules.ndf_max,
+        forage_ratio_min=rules.forage_ratio_min * 100,
+        forage_ratio_max=rules.forage_ratio_max * 100,
+    )
 
 
 # ============================================================
@@ -148,73 +170,63 @@ def rag_search(query: str):
 #
 # This is the path the "Calculate ration" button uses. It does NOT involve the LLM:
 # the exact feed selection and constraints the user entered reach the solver verbatim,
-# so no feed can be silently dropped or re-worded. The agent endpoint below stays for
-# free-text conversation.
+# so no feed can be silently dropped or re-worded.
 # ============================================================
 @app.post("/api/v1/optimize", response_model=OptimizationResponse)
 def optimize(request: OptimizationRequest, db: Session = Depends(get_db)):
     """Compute a nutrition-first, cost-optimal ration from an explicit feed selection.
 
-    Nutrient targets are applied as HARD constraints first; only if that is infeasible
-    are they relaxed, and the response then explains which target could not be met.
-
     Note on units: calcium/phosphorus are g/kg DM (ten times the percentage).
     """
-    from .models import Feed
+    names = request.selected_feed_names
+    if not names:
+        raise HTTPException(status_code=400, detail="En az bir yem seçmelisiniz (selected_feed_names).")
 
-    names = request.selected_feed_names or []
-    if not names and not request.selected_feed_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="En az bir yem seçmelisiniz (selected_feed_names veya selected_feed_ids)."
-        )
-
-    query = db.query(Feed)
-    if names:
-        query = query.filter(Feed.name.in_(names))
-    else:
-        query = query.filter(Feed.id.in_(request.selected_feed_ids))
-    feeds_db = query.all()
-
-    if not feeds_db:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Seçilen yemler veritabanında bulunamadı: {', '.join(names) or request.selected_feed_ids}"
-        )
-
+    feeds_db = db.query(Feed).filter(Feed.name.in_(names)).all()
     # Report names that did not match instead of silently optimizing a smaller set.
-    if names:
-        missing = sorted(set(names) - {f.name for f in feeds_db})
-        if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Şu yemler veritabanında yok: {', '.join(missing)}"
-            )
+    missing = sorted(set(names) - {f.name for f in feeds_db})
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Şu yemler veritabanında yok: {', '.join(missing)}")
 
     feed_inputs = feeds_from_db(feeds_db)
-
-    # Apply the prices the user edited in the UI table.
-    if request.feed_price_overrides:
-        for feed in feed_inputs:
-            override = request.feed_price_overrides.get(feed.name)
-            if override is not None and override > 0:
-                feed.price_per_kg = override
-
-    expected_dm_intake = request.target_dm_intake_kg or (request.body_weight_kg * 0.037)
+    for feed in feed_inputs:
+        override = (request.feed_price_overrides or {}).get(feed.name)
+        if override is not None and override > 0:
+            feed.price_per_kg = override
 
     constraints = NutrientConstraints(
         crude_protein_min=request.crude_protein_min,
         crude_protein_max=request.crude_protein_max,
         metabolic_energy_min=request.metabolic_energy_min,
         metabolic_energy_max=request.metabolic_energy_max,
+        net_energy_lactation_min=request.net_energy_lactation_min,
+        net_energy_lactation_max=request.net_energy_lactation_max,
         calcium_min=request.calcium_min,
         calcium_max=request.calcium_max,
         phosphorus_min=request.phosphorus_min,
         phosphorus_max=request.phosphorus_max,
         dry_matter_min=request.dry_matter_min,
         dry_matter_max=request.dry_matter_max,
-        daily_intake_kg=expected_dm_intake,
+        daily_intake_kg=request.target_dm_intake_kg,
     )
+    body_weight = request.body_weight_kg
+    rules = LACTATING_RULES
+    notes: List[str] = []
+    if request.animal:
+        # Profilden gelen hedefler yalnızca BOŞ alanları doldurur; açık gönderilen kazanır.
+        body_weight = request.animal.body_weight_kg
+        req = compute_requirements(AnimalProfile(**request.animal.model_dump()))
+        derived = requirements_to_constraints(req)
+        for name, value in vars(derived).items():
+            if getattr(constraints, name) is None:
+                setattr(constraints, name, value)
+        rules = RULES_BY_GROUP[req.group]
+        notes = [f"🐄 {rules.label} ineği için NASEM 2021 hedefleri kullanıldı."] + [
+            f"ℹ️ {note}" for note in req.notes
+        ]
+
+    expected_dm_intake = constraints.daily_intake_kg or (body_weight * 0.037)
+    constraints.daily_intake_kg = expected_dm_intake
 
     result = optimize_ration(
         feed_inputs,
@@ -222,30 +234,21 @@ def optimize(request: OptimizationRequest, db: Session = Depends(get_db)):
         use_all_selected=request.use_all_selected_feeds,
         min_inclusion_pct_dm=request.min_inclusion_pct_dm,
         expected_daily_intake_kg=expected_dm_intake,
-        max_daily_intake_kg=(request.body_weight_kg * 0.05) / 0.35,
-        body_weight_kg=request.body_weight_kg,
+        max_daily_intake_kg=(body_weight * 0.05) / 0.35,
+        body_weight_kg=body_weight,
+        rules=rules,
     )
-
+    result.adjustments = notes + result.adjustments
     return optimization_result_to_schema(result, feed_inputs)
-
-
-# Agent endpoints
-class AgentQuery(BaseModel):
-    query: str
 
 
 @app.post("/api/v1/agent/query", response_model=AgentResponse)
 def agent_query(query: AgentQuery):
-    """
-    Process a user query through the RationAI agent.
-    The agent can search the knowledge base, retrieve feed data,
-    and help formulate optimal rations.
-    Returns both a text response and structured optimization data.
+    """Free-text questions through the LLM agent.
 
     Without a GROQ_API_KEY this is the only endpoint that stops working: it answers
-    503 while the rest of the API stays up. A failure inside the agent is a real
-    server error and is reported as HTTP 500 — it is not folded into a 200 response,
-    so callers can tell "the agent answered" apart from "the agent crashed".
+    503 while the rest of the API stays up. A crash inside the agent is reported as
+    HTTP 500 — not folded into a 200 — so callers can tell "answered" from "crashed".
     """
     if not llm_available():
         raise HTTPException(
@@ -253,82 +256,25 @@ def agent_query(query: AgentQuery):
             detail="GROQ_API_KEY tanımlı değil, sohbet uç noktası devre dışı. "
                    "Rasyon hesaplama (/api/v1/optimize) anahtarsız da çalışır.",
         )
-
-    logger.debug("agent_query: query=%r", query.query)
     try:
-        agent_response = run_agent(query.query)
+        return run_agent(query.query)
     except Exception as exc:
-        logger.exception("agent_query failed for query=%r", query.query)
         raise HTTPException(status_code=500, detail=f"Ajan sorguyu yanıtlayamadı: {exc}")
-
-    logger.debug(
-        "agent_query: success=%s, optimization_result=%s",
-        agent_response.success,
-        agent_response.optimization_result is not None,
-    )
-    return agent_response
-
-
-@app.post("/api/v1/agent/initialize")
-def initialize_agent():
-    """
-    Initialize the agent's knowledge base by ingesting documents and seed the feed database.
-    """
-    try:
-        # Initialize knowledge base (ingest documents)
-        result = initialize_knowledge_base()
-        # Seed feed database
-        db = SessionLocal()
-        try:
-            seed_initial_feeds(db)
-            seed_status = "Feed database seeded successfully."
-        finally:
-            db.close()
-        return {"status": result, "seed": seed_status}
-    except Exception as e:
-        logger.exception("initialize_agent başarısız")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# NEW: Feed price sync endpoints
-class PriceSyncResponse(BaseModel):
-    """Response model for feed price synchronization."""
-    updated_at: str
-    updated_feeds_count: int
-    updated_feeds: List[str]
-    baseline_feeds_count: int
-    source: str
-    message: str
-
-
-class FeedPriceUpdate(BaseModel):
-    """Individual feed price update."""
-    name: str
-    price_per_kg: float
 
 
 @app.post("/api/v1/feeds/sync-prices", response_model=PriceSyncResponse)
 def sync_feed_prices(
     db: Session = Depends(get_db),
-    manual_overrides: Optional[List[FeedPriceUpdate]] = None
+    manual_overrides: Optional[List[FeedPriceUpdate]] = None,
 ):
     """Yem fiyatlarını TOBB ticaret borsalarından günceller.
 
     Borsalarda yalnızca tahıl danesi işlem gördüğü için canlı güncellenen yem sayısı
-    sınırlıdır (mısır, arpa, buğday, yulaf, tritikale, nohut). Kalan yemler küratörlü
-    taban fiyatta kalır — bu yanıt hangisinin canlı hangisinin taban olduğunu sayar.
-    Canlı kaynak bulunamazsa fiyatlara dokunulmaz; sahte "güncellendi" bilgisi verilmez.
-
-    Args:
-        manual_overrides: Verilirse canlı çekim yapılmaz, bu fiyatlar uygulanır.
+    sınırlıdır; kalan yemler küratörlü taban fiyatta kalır. Canlı kaynak bulunamazsa
+    fiyatlara dokunulmaz. `manual_overrides` verilirse canlı çekim yapılmaz.
     """
-    timestamp = datetime.now().isoformat()
-
-    price_overrides = None
-    if manual_overrides:
-        price_overrides = {update.name: update.price_per_kg for update in manual_overrides}
-
-    result = update_feed_prices(db, price_overrides)
+    overrides = {u.name: u.price_per_kg for u in manual_overrides} if manual_overrides else None
+    result = update_feed_prices(db, overrides)
     updated_names = [f.name for f in result["updated"]]
     live_count = result["live_count"]
 
@@ -345,20 +291,10 @@ def sync_feed_prices(
         )
 
     return PriceSyncResponse(
-        updated_at=timestamp,
+        updated_at=datetime.now().isoformat(),
         updated_feeds_count=live_count,
         updated_feeds=updated_names,
-        baseline_feeds_count=int(result["baseline_count"]),
+        baseline_feeds_count=result["baseline_count"],
         source=result["source"],
         message=message,
     )
-
-
-@app.post("/api/v1/feeds/update-prices", response_model=dict)
-def update_feed_prices_endpoint(db: Session = Depends(get_db)):
-    """Legacy alias for /api/v1/feeds/sync-prices. Prefer that endpoint."""
-    result = update_feed_prices(db)
-    return {
-        "updated_feeds": [f.name for f in result["updated"]],
-        "live_count": result["live_count"],
-    }
