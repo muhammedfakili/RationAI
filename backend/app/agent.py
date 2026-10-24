@@ -332,6 +332,9 @@ You can call one of these tools:
 Feeds in the database (Turkish names, grouped by type):
 {feed_list}
 
+NEVER write feed amounts (kg) or a ration yourself — every ration must come from
+calculate_ration, which is always available. If the user asks for a ration, call it.
+
 Respond with ONLY a JSON object, no other text:
 - To call a tool: {{"tool": "<tool name>", "args": {{...}}}}
 - To answer directly: {{"answer": "<your answer>"}}
@@ -363,12 +366,28 @@ def _parse_llm_reply(text: str) -> Tuple[Optional[str], Dict[str, Any], Optional
     return None, {}, text
 
 
-def agent_node(state: AgentState):
-    """Ask the LLM to either pick a tool (with args) or answer directly."""
-    user_query = state["messages"][-1].content
-    prompt = SYSTEM_PROMPT.format(feed_list=_feed_list_for_prompt())
-    ai_msg: AIMessage = _get_llm().invoke([SystemMessage(content=prompt), HumanMessage(content=user_query)])
+# gpt-oss sometimes answers a ration request without calculate_ration: it writes feed
+# amounts itself or claims the tool is unavailable. Made-up amounts meet no constraint,
+# so they are never shown — the request is retried once, then refused. A plain answer
+# to a knowledge question ("rasyonda nişasta neden önemli?") passes untouched.
+_RATION_REQUEST = re.compile(r"rasyon|ration|yemleme", re.IGNORECASE)
+_SUSPECT_ANSWER = re.compile(
+    r"\d+(?:[.,]\d+)?\s*kg|erişilemiyor|kullanılamıyor|unavailable", re.IGNORECASE
+)
+_TOOL_REMINDER = (
+    "This is a ration request. Do not answer with amounts yourself: call calculate_ration "
+    "now. It is available."
+)
+_NO_ANSWER = "Üzgünüm, bu soruya şu an yanıt üretemedim. Lütfen tekrar deneyin."
+_NO_RATION = (
+    "Rasyonu şu an hesaplayamadım. Lütfen tekrar deneyin ya da arayüzdeki "
+    "\"Rasyonu hesapla\" butonunu kullanın — o yol dil modeli olmadan çalışır."
+)
 
+
+def _ask_llm(messages) -> Tuple[AIMessage, Optional[str], Dict[str, Any], str]:
+    """Invoke the LLM; return (raw message, tool_name, tool_args, direct_answer)."""
+    ai_msg: AIMessage = _get_llm().invoke(messages)
     response_text = ai_msg.content.strip()
     from_reasoning = not response_text
     if from_reasoning:
@@ -381,9 +400,27 @@ def agent_node(state: AgentState):
     tool_name, tool_args, direct_answer = _parse_llm_reply(response_text)
     unparsed = direct_answer == response_text  # no JSON envelope was found
     if tool_name is None and (not direct_answer.strip() or (from_reasoning and unparsed)):
-        direct_answer = "Üzgünüm, bu soruya şu an yanıt üretemedim. Lütfen tekrar deneyin."
+        direct_answer = _NO_ANSWER
     logger.debug("LLM ham yanıtı: %s", response_text)
     logger.debug("tool_name=%s, tool_args=%s", tool_name, tool_args)
+    return ai_msg, tool_name, tool_args, direct_answer
+
+
+def agent_node(state: AgentState):
+    """Ask the LLM to either pick a tool (with args) or answer directly."""
+    user_query = state["messages"][-1].content
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT.format(feed_list=_feed_list_for_prompt())),
+        HumanMessage(content=user_query),
+    ]
+    ai_msg, tool_name, tool_args, direct_answer = _ask_llm(messages)
+    if tool_name is None and _RATION_REQUEST.search(user_query) and _SUSPECT_ANSWER.search(direct_answer):
+        logger.info("Rasyon isteği araçsız yanıtlandı, yeniden soruluyor")
+        ai_msg, tool_name, tool_args, direct_answer = _ask_llm(
+            messages + [SystemMessage(content=_TOOL_REMINDER)]
+        )
+        if tool_name is None:
+            direct_answer = _NO_RATION
 
     context = dict(state.get("context", {}))
     if tool_name is not None:
