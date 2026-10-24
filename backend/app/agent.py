@@ -35,8 +35,22 @@ logger = logging.getLogger(__name__)
 # can only come from forages and the ration lands in relaxed mode.
 DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz")
 
-# English names the LLM sometimes uses -> database name.
-_ENGLISH_FEED_NAMES = {
+# Short or English names the LLM sometimes uses -> database name. The short Turkish
+# names matter: substring matching sent "yonca" to whichever alfalfa feed came first
+# (often the silage) although farmers mean the hay.
+_FEED_ALIASES = {
+    "yonca": "Yonca Kuru Otu",
+    "kuru yonca": "Yonca Kuru Otu",
+    "soya": "Soya Küspesi",
+    "saman": "Buğday Samanı",
+    "silaj": "Mısır Silajı",
+    "ayçiçeği": "Ayçiçeği Küspesi",
+    "kepek": "Buğday Kepeği",
+    "pancar posası": "Şeker Pancarı Posası",
+    "ddgs": "Mısır DDGS",
+    "bypass yağ": "Korunmuş Yağ (Bypass)",
+    "mermer tozu": "Mermer Tozu",
+    "dcp": "DCP (Dikalsiyum Fosfat)",
     "corn": "Mısır",
     "wheat": "Buğday",
     "barley": "Arpa",
@@ -122,7 +136,7 @@ def parse_constraints(raw: Any, expected_dm_intake_kg: Optional[float] = None) -
 def _match_feed_names(requested: List[str], all_names: List[str]) -> List[str]:
     """Map LLM feed names onto database names: exact, English alias, then substring."""
     by_lower = {name.lower(): name for name in all_names}
-    by_lower.update({en: tr for en, tr in _ENGLISH_FEED_NAMES.items() if tr in all_names})
+    by_lower.update({alias: name for alias, name in _FEED_ALIASES.items() if name in all_names})
     matched: List[str] = []
     for name in requested:
         key = name.lower()
@@ -290,6 +304,10 @@ You can call one of these tools:
        List EVERY feed the user mentioned — never leave one out to make it cheaper; the
        solver decides the amounts. Leave empty to let it choose from all feeds.
        Minerals are added automatically when none is listed.
+       Map the user's words literally — never swap a feed for a "similar" one:
+       plain "yonca" (alfalfa) = "Yonca Kuru Otu"; use a silage name ONLY when the user
+       says "silaj"/"silage" (plain "silaj" = "Mısır Silajı"); "soya" = "Soya Küspesi";
+       "saman" = "Buğday Samanı"; "kepek" = "Buğday Kepeği".
      - Describe the ANIMAL; the tool computes the nutrient targets itself (NASEM 2021).
        Do NOT invent nutrient targets.
        - animal_weight (number, kg, default 650)
