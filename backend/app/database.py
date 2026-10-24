@@ -1,8 +1,7 @@
 import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Load environment variables from .env file in project root
 # __file__ is .../backend/app/database.py
@@ -20,13 +19,6 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
-
-
-# Eski isimden yeni isme geçişler. Upsert öncesi uygulanır ki aynı yem iki kez
-# görünmesin (ör. genel "Saman" -> tür belirten "Buğday Samanı").
-_RENAMED_FEEDS = {
-    "Saman": "Buğday Samanı",
-}
 
 
 # Sonradan eklenen sütunlar: ad -> SQL tipi. SQLite ve PostgreSQL'de aynı DDL çalışır.
@@ -64,18 +56,6 @@ def seed_initial_feeds(db):
     _ensure_columns()
 
     existing = {feed.name: feed for feed in db.query(Feed).all()}
-
-    # Yeniden adlandırılan yemleri taşı (yeni ad zaten varsa eskisini sil).
-    for old_name, new_name in _RENAMED_FEEDS.items():
-        stale = existing.get(old_name)
-        if stale is None:
-            continue
-        if new_name in existing:
-            db.delete(stale)
-        else:
-            stale.name = new_name
-            existing[new_name] = stale
-        existing.pop(old_name)
 
     for data in _get_curated_feeds():
         feed = existing.get(data["name"])
@@ -194,14 +174,8 @@ def get_db():
 
 
 if __name__ == "__main__":
-    # Create tables first
-    from backend.app.models import Feed, Base
+    from backend.app.models import Feed
     Base.metadata.create_all(bind=engine)
-
-    # Then seed
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         seed_initial_feeds(db)
         print(f"Seeded {db.query(Feed).count()} feeds")
-    finally:
-        db.close()

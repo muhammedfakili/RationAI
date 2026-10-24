@@ -7,7 +7,7 @@ class Feed(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
     # Rasyon kurallarının dayandığı sınıf: silage/hay/straw/grain/protein/byproduct/
-    # fat/mineral/salt. Boşsa optimization._classify_feed_type() isimden tahmin eder.
+    # fat/mineral/salt. database._CURATED_FEEDS'ten tohumlanır.
     feed_type = Column(String, index=True, default="unknown")
     price_per_kg = Column(Float)
     # Fiyatın nereden geldiği: "Bandırma TB (+3 borsa)", "taban fiyat" vb.
