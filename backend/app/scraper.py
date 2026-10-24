@@ -16,13 +16,22 @@ arayüzde gösterilir — sessizce "canlı" numarası yapılmaz.
 
 import logging
 import re
+import ssl
 import statistics
+import tempfile
+import warnings
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
+import certifi
 import requests
 from bs4 import BeautifulSoup
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
 from sqlalchemy.orm import Session
 
 from .models import Feed
@@ -78,6 +87,57 @@ PRICE_SANITY_MAX_FACTOR = 3.0
 # Bu kadar günden eski işlem verisi kullanılmaz. Konya borsası Temmuz'da hâlâ
 # Mayıs verisi gösteriyordu - filtre olmadan bayat fiyat "canlı" diye kaydedilirdi.
 MAX_PRICE_AGE_DAYS = 30
+
+
+def _aia_ca_bundle(host: str, timeout: int) -> str:
+    """Sunucunun göndermediği ara sertifikayı AIA adresinden indirip CA paketine ekler.
+
+    ⚠️ borsa.tobb.org.tr Ağustos 2026'daki sertifika yenilemesinden beri zinciri EKSİK
+    gönderiyor (yalnızca kendi sertifikası, Sectigo ara sertifikası yok). Tarayıcılar ve
+    Windows eksiği AIA ile kendisi tamamlar, Python tamamlamaz: her istek SSLError verdi ve
+    canlı fiyat sessizce sıfıra düştü. Sertifika bir daha yenilendiğinde de kendiliğinden
+    çalışsın diye ara sertifika sabit kodlanmaz, her seferinde AIA'dan bulunur.
+
+    AIA adresi düz HTTP'dir; indirilen sertifikaya bu yüzden güvenilmez: (1) sunucu
+    sertifikasını gerçekten imzalamış olmalı, (2) certifi'deki bir kök tarafından
+    imzalanmış olmalı, (3) süresi geçerli olmalı. Biri tutmazsa ValueError.
+    """
+    leaf_pem = ssl.get_server_certificate((host, 443), timeout=timeout)  # doğrulamasız okuma
+    leaf = x509.load_pem_x509_certificate(leaf_pem.encode())
+    aia = leaf.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+    urls = [d.access_location.value for d in aia
+            if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+    if not urls:
+        raise ValueError(f"{host}: sertifikada AIA ara sertifika adresi yok")
+
+    raw = requests.get(urls[0], timeout=timeout).content
+    intermediate = (x509.load_pem_x509_certificate(raw) if raw.lstrip().startswith(b"-----")
+                    else x509.load_der_x509_certificate(raw))
+    leaf.verify_directly_issued_by(intermediate)
+
+    roots_pem = Path(certifi.where()).read_bytes()
+    with warnings.catch_warnings():
+        # certifi'de seri numarası RFC 5280'e uymayan eski bir kök var; zararsız.
+        warnings.simplefilter("ignore")
+        roots = x509.load_pem_x509_certificates(roots_pem)
+
+    def _issued_by(root) -> bool:
+        try:
+            intermediate.verify_directly_issued_by(root)
+            return True
+        except Exception:  # noqa: BLE001 - imza, ad veya anahtar tipi uyuşmazlığı
+            return False
+
+    if not any(_issued_by(root) for root in roots):
+        raise ValueError(f"{host}: AIA ara sertifikası güvenilir bir köke bağlanmıyor")
+    now = datetime.now(timezone.utc)
+    if not intermediate.not_valid_before_utc <= now <= intermediate.not_valid_after_utc:
+        raise ValueError(f"{host}: AIA ara sertifikasının süresi geçerli değil")
+
+    bundle = Path(tempfile.gettempdir()) / f"rationai_ca_{host}.pem"
+    bundle.write_bytes(roots_pem + b"\n" + intermediate.public_bytes(Encoding.PEM))
+    logger.info("%s: eksik ara sertifika AIA'dan tamamlandı (%s)", host, intermediate.subject.rfc4514_string())
+    return str(bundle)
 
 
 @dataclass
@@ -169,13 +229,23 @@ class TurkishFeedPriceScraper:
         low, high = base * PRICE_SANITY_MIN_FACTOR, base * PRICE_SANITY_MAX_FACTOR
         return next((c for c in candidates if low <= c <= high), None)
 
+    def _get(self, url: str, **kwargs) -> requests.Response:
+        """GET; sertifika zinciri eksikse ara sertifikayı AIA'dan tamamlayıp bir kez daha dener."""
+        try:
+            return self.session.get(url, timeout=self.timeout, **kwargs)
+        except requests.exceptions.SSLError:
+            if self.session.verify is not True:
+                raise  # paket zaten tamamlanmış, sorun başka
+            self.session.verify = _aia_ca_bundle(urlparse(url).hostname, self.timeout)
+            return self.session.get(url, timeout=self.timeout, **kwargs)
+
     def scrape_exchange(self, code: str, label: str) -> List[FeedPrice]:
         """Tek bir borsanın fiyat tablosunu çeker."""
         prices: List[FeedPrice] = []
         cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
 
         try:
-            resp = self.session.get(TOBB_BASE_URL, params={"borsakod": code}, timeout=self.timeout)
+            resp = self._get(TOBB_BASE_URL, params={"borsakod": code})
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
             table = BeautifulSoup(resp.text, "html.parser").find("table")

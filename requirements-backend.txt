@@ -19,6 +19,8 @@ PuLP==3.3.2
 # Fiyat scraper'ı (borsa.tobb.org.tr)
 requests==2.34.2
 beautifulsoup4==4.15.0
+# TOBB sunucusu ara sertifikayı göndermiyor; zincir AIA ile tamamlanıp doğrulanıyor.
+cryptography==49.0.0
 
 # RAG + ajan
 chromadb==1.5.9
