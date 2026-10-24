@@ -1,6 +1,10 @@
-"""RationAI - TOBB ticaret borsalarından canlı yem fiyatı çekme.
+"""RationAI - ticaret borsalarından canlı yem fiyatı çekme.
 
-Kaynak: https://borsa.tobb.org.tr/fiyat_borsa.php?borsakod=<KOD>
+İki kaynak:
+1. TOBB birleşik portalı — tahıl danesi (13 borsa, medyan).
+2. Samsun Ticaret Borsası ürün sayfaları — TOBB'da OLMAYAN kepek, saman ve küspe.
+
+Kaynak 1: https://borsa.tobb.org.tr/fiyat_borsa.php?borsakod=<KOD>
 TOBB'un birleşik portalı; her borsa aynı HTML tablo yapısını kullanır:
 
     Ürün Adı | Birim | Son İşlem Tarihi | En Az (TL) | En Çok (TL) |
@@ -9,7 +13,13 @@ TOBB'un birleşik portalı; her borsa aynı HTML tablo yapısını kullanır:
 KAPSAM SINIRI (önemli): borsalar yalnızca TAHIL DANESİ işlem görüyor — mısır, arpa,
 buğday, yulaf, tritikale, nohut. TOBB'da KÜSPELER grubu boş, ÇEŞİTLİ MADDELER'de sadece
 kimyon/süpürge teli var; silaj, yonca ve saman borsada hiç işlem görmüyor (yerel pazar).
-Bu yüzden 37 yemin ~6'sı canlı çekilir, kalanı `database._CURATED_FEEDS` taban fiyatında
+(Ekim 2026'da TOBB'un tüm ürün listesi tarandı: kepek/saman/yonca/küspe hiçbir grupta yok.)
+
+Kaynak 2: https://www.samsuntb.org.tr/urunler/ — her ürünün kendi "son işlemler" tablosu
+(TARİH | EN AZ | EN ÇOK | ORTALAMA | MAHSÜL YILI | SATIŞ ŞEKLİ), yıllara uzanan geçmişle.
+Buğday kepeği, buğday samanı, ayçiçeği ve soya küspesi burada işlem görüyor.
+
+Yine de 37 yemin ~8'i canlı çekilebilir, kalanı `database._CURATED_FEEDS` taban fiyatında
 kalır. Hangi fiyatın canlı hangisinin taban olduğu `Feed.price_source` alanında tutulur ve
 arayüzde gösterilir — sessizce "canlı" numarası yapılmaz.
 """
@@ -69,6 +79,16 @@ TOBB_PRODUCT_PREFIX = {
     "YULAF": "Yulaf",
     "TRİTİKALE": "Tritikale",
     "NOHUT": "Nohut",
+}
+
+# Samsun TB ürün listesindeki ad -> veritabanı yem adı. Sayfa adresleri (slug) ürün
+# kimliği taşıdığı için sabit kodlanmaz; /urunler/ sayfasındaki bağlantılardan bulunur.
+SAMSUN_BASE_URL = "https://www.samsuntb.org.tr"
+SAMSUN_PRODUCTS = {
+    "BUĞDAY KEPEĞİ DÖKME": "Buğday Kepeği",
+    "SAMAN (BUĞDAY)": "Buğday Samanı",
+    "AYÇİÇEK KÜSPESİ": "Ayçiçeği Küspesi",
+    "SOYA KÜSPESİ": "Soya Küspesi",
 }
 
 # Ürün adının devamında bunlardan biri geçiyorsa eşleme İPTAL edilir: dane değil,
@@ -175,6 +195,11 @@ def _parse_turkish_number(text: str) -> List[float]:
         pass
 
     return [c for c in candidates if c > 0]
+
+
+def _tr_upper(text: str) -> str:
+    """Türkçe büyük harf: str.upper() "Kepeği"yi "KEPEĞI" (noktasız) yapar, eşleşme kaçar."""
+    return text.replace("i", "İ").replace("ı", "I").upper()
 
 
 def _parse_date(text: str) -> Optional[datetime]:
@@ -284,13 +309,71 @@ class TurkishFeedPriceScraper:
 
         return prices
 
+    def scrape_samsun(self) -> List[FeedPrice]:
+        """Samsun TB ürün sayfalarından kepek, saman ve küspe fiyatlarını çeker.
+
+        Her ürün için tablodaki EN YENİ satır alınır; `MAX_PRICE_AGE_DAYS`'ten eskiyse
+        ürün atlanır (soya küspesinde son işlem bir yıl önce olabiliyor). Satış şekli
+        "Müstahsil" ise kaynağa yazılır: üreticinin tarlada sattığı fiyattır, nakliye ve
+        balya dahil değildir.
+        """
+        prices: List[FeedPrice] = []
+        cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
+        try:
+            index = self._get(f"{SAMSUN_BASE_URL}/urunler/")
+            index.raise_for_status()
+            index.encoding = index.apparent_encoding or "utf-8"
+            pages: Dict[str, str] = {}
+            for link in BeautifulSoup(index.text, "html.parser").find_all("a", href=True):
+                name = _tr_upper(re.sub(r"\s+", " ", link.get_text(" ", strip=True)))
+                name = name.replace("( ", "(").replace(" )", ")")
+                # Bağlantı metni adın ardından kod ve fiyat da taşır:
+                # "Buğday Kepeği Dökme BUGKEPDOK (SATIM) 13,64 En Az: ..."
+                feed_name = next((feed for key, feed in SAMSUN_PRODUCTS.items()
+                                  if name.startswith(key)), None)
+                if feed_name and "/piyasa-verileri/" in link["href"]:
+                    pages.setdefault(feed_name, link["href"])
+        except Exception as exc:
+            logger.warning("Samsun TB ürün listesi çekilemedi: %s", exc)
+            return prices
+
+        for feed_name, url in pages.items():
+            try:
+                resp = self._get(url if url.startswith("http") else SAMSUN_BASE_URL + url)
+                resp.raise_for_status()
+                resp.encoding = resp.apparent_encoding or "utf-8"
+                table = BeautifulSoup(resp.text, "html.parser").find("table")
+                rows = [[c.get_text(" ", strip=True) for c in tr.find_all("td")]
+                        for tr in (table.find_all("tr") if table else [])]
+                dated = [(d, r) for r in rows if len(r) >= 4 and (d := _parse_date(r[0]))]
+                if not dated:
+                    continue
+                traded_at, row = max(dated, key=lambda item: item[0])
+                if traded_at < cutoff:
+                    continue
+                price = self._plausible_price(feed_name, _parse_turkish_number(row[3]))
+                if price is None:
+                    continue
+                producer = len(row) >= 6 and row[5].strip().lower().startswith("müstahsil")
+                prices.append(FeedPrice(
+                    name=feed_name,
+                    price_per_kg=round(price, 2),
+                    source="Samsun TB" + (" (müstahsil)" if producer else ""),
+                    date=traded_at.date().isoformat(),
+                ))
+            except Exception as exc:
+                logger.warning("Samsun TB %s çekilemedi: %s", feed_name, exc)
+        return prices
+
     def scrape_all(self) -> Dict[str, FeedPrice]:
-        """Tüm borsaları gezip yem başına medyan fiyatı döndürür."""
+        """Tüm kaynakları gezip yem başına medyan fiyatı döndürür."""
         collected: Dict[str, List[FeedPrice]] = {}
 
         for code, label in TOBB_EXCHANGES.items():
             for price in self.scrape_exchange(code, label):
                 collected.setdefault(price.name, []).append(price)
+        for price in self.scrape_samsun():
+            collected.setdefault(price.name, []).append(price)
 
         results: Dict[str, FeedPrice] = {}
         for feed_name, samples in collected.items():
@@ -309,7 +392,7 @@ class TurkishFeedPriceScraper:
                 sample_count=len(samples),
             )
 
-        logger.info("TOBB: %d yem için canlı fiyat bulundu", len(results))
+        logger.info("Borsalar: %d yem için canlı fiyat bulundu", len(results))
         return results
 
 
