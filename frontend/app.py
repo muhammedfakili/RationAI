@@ -546,7 +546,8 @@ with st.sidebar:
         ) if limit_dm else None
 
     if st.button("Güncel piyasa fiyatlarını çek", icon=":material/refresh:", width="stretch",
-                 help="TOBB ve Samsun borsalarından tahıl, kepek, saman ve küspe fiyatları. "
+                 help="Orta-büyük bir işletmenin ortalama TESLİM alış fiyatı: borsa ve piyasa "
+                      "ortalaması (TOBB, Samsun TB, hayvanci.com) + nakliye/yükleme farkı. "
                       "Kendi kaydettiğin fiyatlara dokunulmaz."):
         post_prices("sync-prices", "Borsa fiyatları çekiliyor (~30 sn)...")
 
@@ -662,9 +663,9 @@ if selected_feeds:
             ),
             "Kaynak": st.column_config.TextColumn(
                 width="medium",
-                help="Fiyat canlı borsadan mı, senin kaydettiğin fiyattan mı, taban fiyattan "
-                     "mı geliyor? Silaj, kuru ot ve mineraller borsada işlem görmediği için "
-                     "taban fiyatta kalır.",
+                help="Canlı fiyatlarda hesap açıkça yazar: 'piyasa 3.50 + teslim 1.20' = "
+                     "piyasa ortalaması + çiftliğe nakliye/yükleme. Silaj ve mineraller "
+                     "piyasada izlenmediği için taban fiyatta kalır.",
             ),
             "Kaç günlük": st.column_config.NumberColumn(
                 format="%d gün",

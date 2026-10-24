@@ -74,10 +74,22 @@ RationAI "en ucuz"u ararken şu kurallardan asla taviz vermez:
 
 ## Güncel yem fiyatları
 
-"Güncel piyasa fiyatlarını çek" butonu **TOBB ticaret borsalarından** canlı fiyat getirir.
-Borsalarda yalnızca tahıl (mısır, arpa, buğday, yulaf, nohut) işlem gördüğü için silaj, kuru ot,
-küspe ve mineraller taban fiyatta kalır — her yemin yanında fiyatın nereden geldiği yazar.
-Kendi alış fiyatınızı tabloya yazarsanız hesap onunla yapılır.
+Fiyatlar, **orta-büyük bir süt işletmesinin yemi çiftliğe teslim alırken ödediği ortalama
+fiyat** olarak hesaplanır — tek bir satıcının değil, piyasanın ortalaması:
+
+> **Teslim fiyatı = piyasa ortalaması + nakliye/yükleme farkı**
+> Örnek: saman piyasada 3,50 TL/kg + teslim 1,20 TL/kg = **4,70 TL/kg**
+
+- **Piyasa ortalaması:** TOBB ticaret borsaları (tahıllar), Samsun Ticaret Borsası (kepek,
+  küspe) ve hayvanci.com piyasa fiyatlarının (saman, yonca, küspe, tahıl) ortancası.
+  Üreticinin tarlada sattığı (müstahsil) fiyatlar alınmaz — işletme tüccardan alır.
+- **Teslim farkı:** saman ve kuru ot hacimli olduğu için +1,20 TL/kg, tahıl, küspe ve kepek
+  dökme taşındığı için +0,50 TL/kg.
+- Mısır, arpa, buğday, yulaf, nohut, buğday kepeği, ayçiçeği küspesi, saman ve yonca canlı
+  güncellenir. Silaj ve mineraller piyasada izlenmediği için taban fiyatta kalır; her fiyatın
+  kaç günlük olduğu tabloda yazar, eskiyenler uyarı verir.
+- **Kendi fiyatınız her zaman önce gelir:** tabloya alış fiyatınızı yazıp "Fiyatlarımı kaydet"e
+  basarsanız sonraki hesaplarda da o kullanılır ve canlı güncelleme onu değiştirmez.
 
 ## Soru da sorabilirsiniz
 
@@ -140,7 +152,9 @@ Streamlit arayüz ──HTTP──▶ FastAPI ──▶ PuLP/CBC doğrusal progr
   çözümsüzse gevşetilir ve Türkçe teşhis üretilir (`nutrition_mode: hard | relaxed | infeasible`).
   Protein NRC 2001 tarzında hesaplanır: mikrobiyal protein = min(0.13·TSBM, 0.85·RDP),
   MP = 0.64·mikrobiyal + 0.80·RUP.
-- **Fiyatlar:** `borsa.tobb.org.tr` kazınır; her yem fiyat kaynağını (`price_source`) taşır.
+- **Fiyatlar:** `borsa.tobb.org.tr`, `samsuntb.org.tr` ve `hayvanci.com/fiyatlar` kazınır,
+  yem başına medyan alınıp yem tipine göre teslim farkı eklenir; her yem fiyat kaynağını ve
+  hesabını (`price_source`) taşır.
 
 ### Teknoloji
 

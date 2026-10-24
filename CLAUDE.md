@@ -232,16 +232,27 @@ never send a `dry_matter` as‑fed range by default — a silage TMR sits near 3
   was deleted — running it wiped the forages.)
 
 ## Prices: what is live and what is not
-`scraper.py` has two sources, merged per feed by median:
+**Perspective: the average DELIVERED purchase price of a medium‑to‑large dairy operation**, not
+one seller's quote. `scrape_all()` takes the median of every source sample per feed (market
+price) and adds `DELIVERY_PREMIUM_TL_KG` by feed type — straw/hay +1.20, grain/protein/
+byproduct +0.50 TL/kg (2026 haulage: ~1,200–1,800 TL/t intercity for bulky forage; a truck
+carries about half as much straw as grain). The label shows the arithmetic:
+`"piyasa 3.50 + teslim 1.20 · hayvanci.com"`. Farm‑gate (müstahsil) rows are skipped — an
+operation buys from traders, and Samsun's farm‑gate straw (2.21) sat far below market (3.50).
+
+`scraper.py` has three sources:
 1. **`borsa.tobb.org.tr`** — TOBB's unified exchange portal, one HTML table shape across 13
    exchanges, TL/kg. **Grains only**: in Oct 2026 the whole product tree was scanned — the
    KÜSPELER group is empty and there is no bran, straw, hay or silage anywhere.
 2. **`samsuntb.org.tr/urunler/`** — Samsun TB product pages ("son işlemler" tables with years
    of history): wheat bran, wheat straw, sunflower meal, soybean meal. Product URLs carry ids,
    so they are found by link text (`SAMSUN_PRODUCTS`, prefix match — the link text also holds
-   a code and the price). Straw there is a **müstahsil** (farm‑gate) price, labelled as such.
+   a code and the price).
+3. **`hayvanci.com/fiyatlar/<slug>`** — dated market price tables (robots.txt allows
+   `/fiyatlar`): straw (applied to both straws), alfalfa hay, sunflower meal, grains.
+   ⚠️ Its "soya" is soybean **seed** (28 TL/kg, Adana growers), not meal — never map it.
 
-So ~8 of 37 feeds update live; silages, hays and minerals stay on the curated baseline.
+So ~10 of 37 feeds update live; silages, most hays and minerals stay on the curated baseline.
 Do not present baseline prices as live: `Feed.price_source` and `price_updated_at` record the
 origin. Baseline rows carry `BASELINE_PRICE_DATE` (2026‑07‑15) so the UI computes every
 feed's age the same way and warns above `STALE_PRICE_DAYS` (45, minerals excluded).
