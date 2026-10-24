@@ -293,9 +293,9 @@ def sync_feed_prices(
         )
     else:
         message = (
-            f"{live_count} yemin fiyatı canlı borsadan güncellendi: "
-            f"{', '.join(updated_names)}. Kalan {result['baseline_count']} yem "
-            "taban fiyatta (silaj, kuru ot ve mineraller borsada işlem görmüyor)."
+            f"{live_count} yemin işletme teslim fiyatı güncellendi (piyasa ortalaması + "
+            f"nakliye): {', '.join(updated_names)}. Kalan {result['baseline_count']} yem "
+            "taban fiyatta (silaj, bazı kuru otlar ve mineraller piyasada izlenmiyor)."
         )
     if kept:
         message += f" Kendi kaydettiğin fiyatlara dokunulmadı: {', '.join(kept)}."
