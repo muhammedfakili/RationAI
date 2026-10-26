@@ -134,7 +134,8 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
 | `POST` | `/api/v1/requirements` | NASEM 2021 targets for an `AnimalProfileIn` + the group's NDF/forage windows (the sidebar reads this) |
 | `POST` | `/api/v1/optimize` | **Deterministic ration optimization** — the Streamlit "Calculate" button uses this; no LLM involved. With `animal`, empty targets are filled from the requirements and the group's rules apply |
 | `POST` | `/api/v1/agent/query` | Free-text ration questions through the LangGraph agent. **503 when `GROQ_API_KEY` is unset** — the only endpoint that needs it |
-| `POST` | `/api/v1/feeds/sync-prices` | Live market price sync, optional manual overrides |
+| `POST` | `/api/v1/feeds/sync-prices` | Live delivered-price sync (TOBB + Samsun TB + hayvanci.com, + delivery premium); a JSON list body instead saves the user's own prices as `"elle girildi"` |
+| `POST` | `/api/v1/feeds/reset-prices` | Returns saved (`"elle girildi"`) prices to the curated baseline |
 
 ## Architecture Notes
 - **Two request paths.** The Streamlit "Rasyonu Hesapla" button posts a typed
@@ -231,14 +232,42 @@ never send a `dry_matter` as‑fed range by default — a silage TMR sits near 3
   was deleted — running it wiped the forages.)
 
 ## Prices: what is live and what is not
-`scraper.py` scrapes **`borsa.tobb.org.tr`** — TOBB's unified exchange portal, one HTML table
-shape across every exchange, prices already TL/kg. It is the only structured Turkish source
-that actually works.
+**Perspective: the average DELIVERED purchase price of a medium‑to‑large dairy operation**, not
+one seller's quote. `scrape_all()` takes the median of every source sample per feed (market
+price) and adds `DELIVERY_PREMIUM_TL_KG` by feed type — straw/hay +1.20, grain/protein/
+byproduct +0.50 TL/kg (2026 haulage: ~1,200–1,800 TL/t intercity for bulky forage; a truck
+carries about half as much straw as grain). The label shows the arithmetic:
+`"piyasa 3.50 + teslim 1.20 · hayvanci.com"`. Farm‑gate (müstahsil) rows are skipped — an
+operation buys from traders, and Samsun's farm‑gate straw (2.21) sat far below market (3.50).
 
-**It only covers grains.** TOBB's KÜSPELER group is empty and silage/hay/straw are never
-exchange‑traded, so ~5 feeds (corn, barley, wheat, oats, chickpea) update live and the other
-~32 stay on the curated baseline. Do not present baseline prices as live: `Feed.price_source`
-and `price_updated_at` record the origin and the UI shows it per feed.
+`scraper.py` has three sources:
+1. **`borsa.tobb.org.tr`** — TOBB's unified exchange portal, one HTML table shape across 13
+   exchanges, TL/kg. **Grains only**: in Oct 2026 the whole product tree was scanned — the
+   KÜSPELER group is empty and there is no bran, straw, hay or silage anywhere.
+2. **`samsuntb.org.tr/urunler/`** — Samsun TB product pages ("son işlemler" tables with years
+   of history): wheat bran, wheat straw, sunflower meal, soybean meal. Product URLs carry ids,
+   so they are found by link text (`SAMSUN_PRODUCTS`, prefix match — the link text also holds
+   a code and the price).
+3. **`hayvanci.com/fiyatlar/<slug>`** — dated market price tables (robots.txt allows
+   `/fiyatlar`): straw (applied to both straws), alfalfa hay, sunflower meal, grains.
+   ⚠️ Its "soya" is soybean **seed** (28 TL/kg, Adana growers), not meal — never map it.
+
+So ~10 of 37 feeds update live; silages, most hays and minerals stay on the curated baseline.
+Do not present baseline prices as live: `Feed.price_source` and `price_updated_at` record the
+origin. Baseline rows carry `BASELINE_PRICE_DATE` (2026‑07‑15) so the UI computes every
+feed's age the same way and warns above `STALE_PRICE_DAYS` (45, minerals excluded).
+
+**User prices win.** The UI's "Fiyatlarımı kaydet" posts changed prices as a list body to
+`sync-prices`; they are stored as `"elle girildi"` (`MANUAL_SOURCE`) and a live sync never
+overwrites them (`kept_manual` in the result). `reset-prices` returns them to baseline.
+
+⚠️ **TLS:** since TOBB's certificate renewal (26 Aug 2026) the server sends no intermediate
+certificate. Browsers and Windows schannel complete the chain via AIA; Python does not, so
+every request failed with `CERTIFICATE_VERIFY_FAILED` and the sync silently returned 0 prices.
+`_aia_ca_bundle()` downloads the intermediate from the leaf's AIA URL and **verifies it** (it
+signed the leaf, a certifi root signed it, it is in date) before adding it to a CA bundle —
+the AIA URL is plain HTTP, so never trust it unverified. Do not "fix" this with `verify=False`.
+Turkish text: `str.upper()` turns "Kepeği" into "KEPEĞI" (dotless) — use `_tr_upper()`.
 
 Parsing traps handled — keep them:
 - TOBB mixes number formats in one column (`13,570` = 13.57 but `12.007,000` = 12.007).

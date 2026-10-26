@@ -8,6 +8,7 @@ Hesaplama deterministik `/api/v1/optimize` uç noktasına gider, LLM devrede de�
 """
 
 import os
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import altair as alt
@@ -18,6 +19,9 @@ import streamlit as st
 # Docker compose'ta servis adıyla konuşulur (http://backend:8000/api/v1).
 # Varsayılan localhost, konteynersiz `quickstart.py` akışı bozulmasın diye korunur.
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/api/v1")
+
+# Bu kadar günden eski fiyatlar için kullanıcı uyarılır (enflasyon ayda ~%2-4).
+STALE_PRICE_DAYS = 45
 
 # Hedefler (NASEM 2021) ve grubun rasyon kuralları backend'den gelir: /requirements.
 GROUP_LABELS = {
@@ -74,6 +78,38 @@ def fetch_requirements(profile: Dict) -> Optional[Dict]:
     except Exception as exc:
         st.error(f"İhtiyaç hesaplanamadı: {exc}", icon=":material/error:")
         return None
+
+
+def post_prices(path: str, spinner: str, body=None, timeout: int = 120) -> None:
+    """Fiyat uç noktasını çağırır; başarıda önbelleği ve fiyat tablosunu sıfırlayıp yeniler.
+
+    Mesaj yenilemeden sonra gösterilsin diye session_state'e yazılır.
+    """
+    with st.spinner(spinner):
+        try:
+            resp = requests.post(f"{BACKEND_URL}/feeds/{path}", json=body, timeout=timeout)
+        except requests.exceptions.Timeout:
+            st.error(f"İstek zaman aşımına uğradı ({timeout} sn).", icon=":material/error:")
+            return
+        except Exception as exc:
+            st.error(f"Bağlantı hatası: {exc}", icon=":material/error:")
+            return
+    if resp.status_code != 200:
+        st.error(f"Fiyat işlemi başarısız: {resp.text}", icon=":material/error:")
+        return
+    st.cache_data.clear()
+    for key in [k for k in st.session_state if k.startswith("price_editor")]:
+        st.session_state.pop(key, None)
+    st.session_state["price_sync_message"] = resp.json()["message"]
+    st.rerun()
+
+
+def price_age_days(feed: Dict) -> Optional[int]:
+    """Fiyatın kaç günlük olduğu (`price_updated_at`'ten; taban fiyatta toplandığı tarih)."""
+    stamp = feed.get("price_updated_at")
+    if not stamp:
+        return None
+    return max((datetime.now() - datetime.fromisoformat(stamp)).days, 0)
 
 
 def call_optimization_api(payload: Dict) -> Optional[Dict]:
@@ -509,27 +545,16 @@ with st.sidebar:
             min_value=25.0, max_value=95.0, value=(40.0, 60.0), step=1.0,
         ) if limit_dm else None
 
-    if st.button("Güncel piyasa fiyatlarını çek", icon=":material/refresh:", width="stretch"):
-        with st.spinner("Borsa ve piyasa fiyatları çekiliyor..."):
-            try:
-                resp = requests.post(f"{BACKEND_URL}/feeds/sync-prices", timeout=60)
-                if resp.status_code == 200:
-                    info = resp.json()
-                    st.cache_data.clear()
-                    for key in [k for k in st.session_state if k.startswith("price_editor")]:
-                        st.session_state.pop(key, None)
-                    st.session_state["price_sync_message"] = info["message"]
-                    st.rerun()
-                else:
-                    st.error(f"Senkronizasyon hatası: {resp.text}", icon=":material/error:")
-            except requests.exceptions.Timeout:
-                st.error("İstek zaman aşımına uğradı (60 sn).", icon=":material/error:")
-            except Exception as exc:
-                st.error(f"Bağlantı hatası: {exc}", icon=":material/error:")
+    if st.button("Güncel piyasa fiyatlarını çek", icon=":material/refresh:", width="stretch",
+                 help="Orta-büyük bir işletmenin ortalama TESLİM alış fiyatı: borsa ve piyasa "
+                      "ortalaması (TOBB, Samsun TB, hayvanci.com) + nakliye/yükleme farkı. "
+                      "Kendi kaydettiğin fiyatlara dokunulmaz."):
+        post_prices("sync-prices", "Borsa fiyatları çekiliyor (~30 sn)...")
 
     # Senkron sonucu rerun'dan sonra gösterilir; canlı/taban ayrımını net söyler.
     sync_message = st.session_state.pop("price_sync_message", None)
     if sync_message:
+        st.toast(sync_message, icon=":material/sell:")
         st.caption(sync_message)
 
 targets = {
@@ -617,12 +642,16 @@ if selected_feeds:
             "Yem": name,
             "Fiyat (TL/kg)": round(feeds_by_name[name].get("price_per_kg", 0) or 0, 2),
             "Kaynak": feeds_by_name[name].get("price_source") or "taban fiyat",
+            "Kaç günlük": price_age_days(feeds_by_name[name]),
             "Max kg/gün": _health_cap(feeds_by_name[name]),
             "HP (%)": round(feeds_by_name[name].get("crude_protein", 0) or 0, 1),
             "NEL (Mcal/kg)": round(feeds_by_name[name].get("net_energy_lactation", 0) or 0, 2),
         }
         for name in selected_feeds
     ])
+    # None'lu sütun "object" tipinde kalır ve hücrede "None" yazar; sayıya çevrilince boş görünür.
+    for column in ("Max kg/gün", "Kaç günlük"):
+        price_df[column] = pd.to_numeric(price_df[column])
 
     edited_prices = st.data_editor(
         price_df,
@@ -634,8 +663,14 @@ if selected_feeds:
             ),
             "Kaynak": st.column_config.TextColumn(
                 width="medium",
-                help="Fiyat canlı borsadan mı geldi yoksa taban fiyat mı? Silaj, kuru ot, "
-                     "küspe ve mineraller borsada işlem görmediği için taban fiyatta kalır.",
+                help="Canlı fiyatlarda hesap açıkça yazar: 'piyasa 3.50 + teslim 1.20' = "
+                     "piyasa ortalaması + çiftliğe nakliye/yükleme. Silaj ve mineraller "
+                     "piyasada izlenmediği için taban fiyatta kalır.",
+            ),
+            "Kaç günlük": st.column_config.NumberColumn(
+                format="%d gün",
+                help=f"Fiyatın güncellendiği tarihten bu yana geçen süre; "
+                     f"{STALE_PRICE_DAYS} günden eskisi uyarı verir.",
             ),
             "Max kg/gün": st.column_config.NumberColumn(
                 format="%.1f",
@@ -645,7 +680,7 @@ if selected_feeds:
             "HP (%)": st.column_config.NumberColumn(format="%.1f"),
             "NEL (Mcal/kg)": st.column_config.NumberColumn(format="%.2f"),
         },
-        disabled=["Yem", "Kaynak", "Max kg/gün", "HP (%)", "NEL (Mcal/kg)"],
+        disabled=["Yem", "Kaynak", "Kaç günlük", "Max kg/gün", "HP (%)", "NEL (Mcal/kg)"],
         hide_index=True,
         num_rows="fixed",
         width="stretch",
@@ -654,6 +689,39 @@ if selected_feeds:
         key="price_editor_" + "|".join(selected_feeds),
     )
     price_overrides = dict(zip(edited_prices["Yem"], edited_prices["Fiyat (TL/kg)"]))
+
+    # Mineraller rasyon maliyetinin küçük bir kısmı ve fiyatları yavaş değişir: uyarıyı
+    # kalabalıklaştırmasınlar.
+    stale = [name for name in selected_feeds
+             if feeds_by_name[name].get("feed_type") not in MINERAL_TYPES
+             and (price_age_days(feeds_by_name[name]) or 0) > STALE_PRICE_DAYS]
+    if stale:
+        st.warning(
+            f"Şu yemlerin fiyatı {STALE_PRICE_DAYS} günden eski: **{', '.join(stale)}**. "
+            "Kendi alış fiyatını tabloya yazıp kaydet ya da güncel piyasa fiyatlarını çek.",
+            icon=":material/schedule:",
+        )
+
+    changed = [
+        {"name": name, "price_per_kg": float(price)}
+        for name, price in price_overrides.items()
+        if price and abs(price - (feeds_by_name[name].get("price_per_kg") or 0)) > 0.005
+    ]
+    has_saved = any(feed.get("price_source") == "elle girildi" for feed in feeds_data)
+    with st.container(horizontal=True):
+        if st.button(
+            f"Fiyatlarımı kaydet ({len(changed)})", icon=":material/save:",
+            disabled=not changed,
+            help="Tabloda değiştirdiğin fiyatlar kaydedilir; sonraki hesaplarda da kullanılır "
+                 "ve canlı senkron bunları ezmez.",
+        ):
+            post_prices("sync-prices", "Fiyatlar kaydediliyor...", body=changed, timeout=30)
+        if has_saved and st.button(
+            "Kaydettiğim fiyatları sil", icon=":material/restart_alt:",
+            help="Kaydettiğin bütün fiyatlar taban fiyata döner; sonra güncel fiyatları "
+                 "çekebilirsin.",
+        ):
+            post_prices("reset-prices", "Kayıtlı fiyatlar siliniyor...", timeout=30)
 else:
     st.info("Başlamak için en az bir yem seç.", icon=":material/info:")
 

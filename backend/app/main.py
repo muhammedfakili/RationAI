@@ -34,7 +34,7 @@ from .schemas import (
     PriceSyncResponse,
     RequirementsResponse,
 )
-from .scraper import update_feed_prices
+from .scraper import reset_manual_prices, update_feed_prices
 
 # Uvicorn only configures its own loggers, so without this the backend's module
 # loggers fall back to the WARNING-only "last resort" handler. The level is raised on
@@ -271,28 +271,34 @@ def sync_feed_prices(
     db: Session = Depends(get_db),
     manual_overrides: Optional[List[FeedPriceUpdate]] = None,
 ):
-    """Yem fiyatlarını TOBB ticaret borsalarından günceller.
+    """Yem fiyatlarını borsalardan (TOBB + Samsun TB) günceller ya da kullanıcının
+    kendi fiyatlarını kaydeder.
 
-    Borsalarda yalnızca tahıl danesi işlem gördüğü için canlı güncellenen yem sayısı
-    sınırlıdır; kalan yemler küratörlü taban fiyatta kalır. Canlı kaynak bulunamazsa
-    fiyatlara dokunulmaz. `manual_overrides` verilirse canlı çekim yapılmaz.
+    `manual_overrides` verilirse canlı çekim yapılmaz, bu fiyatlar "elle girildi" olarak
+    kaydedilir. Canlı senkron elle girilmiş fiyatları ezmez. Canlı kaynak bulunamazsa
+    fiyatlara dokunulmaz.
     """
     overrides = {u.name: u.price_per_kg for u in manual_overrides} if manual_overrides else None
     result = update_feed_prices(db, overrides)
     updated_names = [f.name for f in result["updated"]]
     live_count = result["live_count"]
+    kept = result["kept_manual"]
 
-    if live_count == 0:
+    if overrides is not None:
+        message = f"{live_count} yemin fiyatı kaydedildi: {', '.join(updated_names)}."
+    elif live_count == 0:
         message = (
             "Canlı borsa verisi bulunamadı (kaynak ulaşılamıyor veya veriler 30 günden "
-            "eski). Fiyatlara dokunulmadı, taban fiyatlar geçerli."
+            "eski). Fiyatlara dokunulmadı."
         )
     else:
         message = (
-            f"{live_count} yemin fiyatı canlı borsadan güncellendi: "
-            f"{', '.join(updated_names)}. Kalan {result['baseline_count']} yem "
-            "taban fiyatta (silaj, kuru ot, küspe ve mineraller borsada işlem görmüyor)."
+            f"{live_count} yemin işletme teslim fiyatı güncellendi (piyasa ortalaması + "
+            f"nakliye): {', '.join(updated_names)}. Kalan {result['baseline_count']} yem "
+            "taban fiyatta (silaj, bazı kuru otlar ve mineraller piyasada izlenmiyor)."
         )
+    if kept:
+        message += f" Kendi kaydettiğin fiyatlara dokunulmadı: {', '.join(kept)}."
 
     return PriceSyncResponse(
         updated_at=datetime.now().isoformat(),
@@ -301,4 +307,12 @@ def sync_feed_prices(
         baseline_feeds_count=result["baseline_count"],
         source=result["source"],
         message=message,
+        kept_manual_feeds=kept,
     )
+
+
+@app.post("/api/v1/feeds/reset-prices")
+def reset_prices(db: Session = Depends(get_db)):
+    """Elle kaydedilen fiyatları taban fiyata döndürür; sonraki senkron piyasadan günceller."""
+    reset = reset_manual_prices(db)
+    return {"reset_feeds": reset, "message": f"{len(reset)} yemin kayıtlı fiyatı silindi."}

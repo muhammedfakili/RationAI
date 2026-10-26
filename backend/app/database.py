@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -20,6 +22,12 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+
+# Küratörlü taban fiyatların toplandığı tarih. `price_updated_at` olarak yazılır ki arayüz
+# taban fiyatın kaç günlük olduğunu canlı fiyatlarla aynı alandan hesaplayabilsin.
+BASELINE_PRICE_DATE = datetime(2026, 7, 15)
+BASELINE_SOURCE = "taban fiyat"
+MANUAL_SOURCE = "elle girildi"
 
 # Sonradan eklenen sütunlar: ad -> SQL tipi. SQLite ve PostgreSQL'de aynı DDL çalışır.
 _ADDED_COLUMNS = {
@@ -63,7 +71,7 @@ def seed_initial_feeds(db):
     for data in _get_curated_feeds():
         feed = existing.get(data["name"])
         if feed is None:
-            db.add(Feed(price_source="taban fiyat", **data))
+            db.add(Feed(price_source=BASELINE_SOURCE, price_updated_at=BASELINE_PRICE_DATE, **data))
             continue
         for field, value in data.items():
             if field == "name":
@@ -71,9 +79,10 @@ def seed_initial_feeds(db):
             if field == "price_per_kg":
                 # Canlı borsadan gelen veya kullanıcının girdiği fiyatı ezme;
                 # yalnızca taban fiyatta duran kayıtlar güncellenir.
-                if feed.price_source in (None, "", "taban fiyat"):
+                if feed.price_source in (None, "", BASELINE_SOURCE):
                     feed.price_per_kg = value
-                    feed.price_source = "taban fiyat"
+                    feed.price_source = BASELINE_SOURCE
+                    feed.price_updated_at = BASELINE_PRICE_DATE
                 continue
             setattr(feed, field, value)
 

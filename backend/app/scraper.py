@@ -1,6 +1,15 @@
-"""RationAI - TOBB ticaret borsalarından canlı yem fiyatı çekme.
+"""RationAI - canlı yem fiyatı: orta-büyük bir süt işletmesinin ortalama TESLİM ALIŞ fiyatı.
 
-Kaynak: https://borsa.tobb.org.tr/fiyat_borsa.php?borsakod=<KOD>
+Bakış açısı: fiyat, işletmenin yemi çiftliğe teslim alırken ödediği ortalama tutardır —
+tek bir satıcının fiyatı değil. Bu yüzden:
+    teslim fiyatı = piyasa ortalaması (kaynakların medyanı) + teslim farkı (nakliye/yükleme)
+
+Üç kaynak:
+1. TOBB birleşik portalı — tahıl danesi (13 borsa).
+2. Samsun Ticaret Borsası ürün sayfaları — TOBB'da OLMAYAN kepek ve küspe.
+3. hayvanci.com piyasa fiyatları — saman, yonca, ayçiçeği küspesi ve tahıllar.
+
+Kaynak 1: https://borsa.tobb.org.tr/fiyat_borsa.php?borsakod=<KOD>
 TOBB'un birleşik portalı; her borsa aynı HTML tablo yapısını kullanır:
 
     Ürün Adı | Birim | Son İşlem Tarihi | En Az (TL) | En Çok (TL) |
@@ -9,20 +18,35 @@ TOBB'un birleşik portalı; her borsa aynı HTML tablo yapısını kullanır:
 KAPSAM SINIRI (önemli): borsalar yalnızca TAHIL DANESİ işlem görüyor — mısır, arpa,
 buğday, yulaf, tritikale, nohut. TOBB'da KÜSPELER grubu boş, ÇEŞİTLİ MADDELER'de sadece
 kimyon/süpürge teli var; silaj, yonca ve saman borsada hiç işlem görmüyor (yerel pazar).
-Bu yüzden 37 yemin ~6'sı canlı çekilir, kalanı `database._CURATED_FEEDS` taban fiyatında
+(Ekim 2026'da TOBB'un tüm ürün listesi tarandı: kepek/saman/yonca/küspe hiçbir grupta yok.)
+
+Kaynak 2: https://www.samsuntb.org.tr/urunler/ — her ürünün kendi "son işlemler" tablosu
+(TARİH | EN AZ | EN ÇOK | ORTALAMA | MAHSÜL YILI | SATIŞ ŞEKLİ), yıllara uzanan geçmişle.
+Buğday kepeği, buğday samanı, ayçiçeği ve soya küspesi burada işlem görüyor.
+
+Yine de 37 yemin ~8'i canlı çekilebilir, kalanı `database._CURATED_FEEDS` taban fiyatında
 kalır. Hangi fiyatın canlı hangisinin taban olduğu `Feed.price_source` alanında tutulur ve
 arayüzde gösterilir — sessizce "canlı" numarası yapılmaz.
 """
 
 import logging
 import re
+import ssl
 import statistics
+import tempfile
+import warnings
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
+import certifi
 import requests
 from bs4 import BeautifulSoup
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
 from sqlalchemy.orm import Session
 
 from .models import Feed
@@ -62,6 +86,40 @@ TOBB_PRODUCT_PREFIX = {
     "NOHUT": "Nohut",
 }
 
+# Samsun TB ürün listesindeki ad -> veritabanı yem adı. Sayfa adresleri (slug) ürün
+# kimliği taşıdığı için sabit kodlanmaz; /urunler/ sayfasındaki bağlantılardan bulunur.
+SAMSUN_BASE_URL = "https://www.samsuntb.org.tr"
+# hayvanci.com/fiyatlar/<slug>: tarihli "Tarih | Fiyat | Değişim" tablosu (robots.txt
+# /fiyatlar'a izin veriyor). Genel "saman" iki saman yemine de uygulanır.
+# ⚠️ Oradaki "soya" soya FASULYESİDİR (28 TL/kg, Adana üretici bildirimleri) — küspe değil,
+# bu yüzden eşlenmez.
+HAYVANCI_BASE_URL = "https://hayvanci.com/fiyatlar"
+HAYVANCI_PRODUCTS = {
+    "saman": ("Buğday Samanı", "Arpa Samanı"),
+    "yonca": ("Yonca Kuru Otu",),
+    "aycicegi-kuspesi": ("Ayçiçeği Küspesi",),
+    "arpa": ("Arpa",),
+    "bugday": ("Buğday",),
+    "misir": ("Mısır",),
+    "nohut": ("Nohut",),
+}
+
+# Piyasa fiyatının üstüne eklenen TESLİM FARKI (TL/kg): yükleme + çiftliğe nakliye.
+# Kaynak: 2026 piyasa derlemeleri — şehirlerarası tır nakliyesi kaba yemde ~1.200-1.800
+# TL/ton, kısa mesafede balya başına 15-25 TL. Saman/kuru ot hacimli olduğu için bir tıra
+# tahılın yaklaşık yarısı kadar yüklenir; ton başına nakliyesi dökme konsantrenin ~2 katı.
+DELIVERY_PREMIUM_TL_KG = {
+    "straw": 1.20, "hay": 1.20,
+    "grain": 0.50, "protein": 0.50, "byproduct": 0.50,
+}
+
+SAMSUN_PRODUCTS = {
+    "BUĞDAY KEPEĞİ DÖKME": "Buğday Kepeği",
+    "SAMAN (BUĞDAY)": "Buğday Samanı",
+    "AYÇİÇEK KÜSPESİ": "Ayçiçeği Küspesi",
+    "SOYA KÜSPESİ": "Soya Küspesi",
+}
+
 # Ürün adının devamında bunlardan biri geçiyorsa eşleme İPTAL edilir: dane değil,
 # işlenmiş/kaba yem ürünüdür.
 _EXCLUDED_TOKENS = (
@@ -78,6 +136,57 @@ PRICE_SANITY_MAX_FACTOR = 3.0
 # Bu kadar günden eski işlem verisi kullanılmaz. Konya borsası Temmuz'da hâlâ
 # Mayıs verisi gösteriyordu - filtre olmadan bayat fiyat "canlı" diye kaydedilirdi.
 MAX_PRICE_AGE_DAYS = 30
+
+
+def _aia_ca_bundle(host: str, timeout: int) -> str:
+    """Sunucunun göndermediği ara sertifikayı AIA adresinden indirip CA paketine ekler.
+
+    ⚠️ borsa.tobb.org.tr Ağustos 2026'daki sertifika yenilemesinden beri zinciri EKSİK
+    gönderiyor (yalnızca kendi sertifikası, Sectigo ara sertifikası yok). Tarayıcılar ve
+    Windows eksiği AIA ile kendisi tamamlar, Python tamamlamaz: her istek SSLError verdi ve
+    canlı fiyat sessizce sıfıra düştü. Sertifika bir daha yenilendiğinde de kendiliğinden
+    çalışsın diye ara sertifika sabit kodlanmaz, her seferinde AIA'dan bulunur.
+
+    AIA adresi düz HTTP'dir; indirilen sertifikaya bu yüzden güvenilmez: (1) sunucu
+    sertifikasını gerçekten imzalamış olmalı, (2) certifi'deki bir kök tarafından
+    imzalanmış olmalı, (3) süresi geçerli olmalı. Biri tutmazsa ValueError.
+    """
+    leaf_pem = ssl.get_server_certificate((host, 443), timeout=timeout)  # doğrulamasız okuma
+    leaf = x509.load_pem_x509_certificate(leaf_pem.encode())
+    aia = leaf.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+    urls = [d.access_location.value for d in aia
+            if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+    if not urls:
+        raise ValueError(f"{host}: sertifikada AIA ara sertifika adresi yok")
+
+    raw = requests.get(urls[0], timeout=timeout).content
+    intermediate = (x509.load_pem_x509_certificate(raw) if raw.lstrip().startswith(b"-----")
+                    else x509.load_der_x509_certificate(raw))
+    leaf.verify_directly_issued_by(intermediate)
+
+    roots_pem = Path(certifi.where()).read_bytes()
+    with warnings.catch_warnings():
+        # certifi'de seri numarası RFC 5280'e uymayan eski bir kök var; zararsız.
+        warnings.simplefilter("ignore")
+        roots = x509.load_pem_x509_certificates(roots_pem)
+
+    def _issued_by(root) -> bool:
+        try:
+            intermediate.verify_directly_issued_by(root)
+            return True
+        except Exception:  # noqa: BLE001 - imza, ad veya anahtar tipi uyuşmazlığı
+            return False
+
+    if not any(_issued_by(root) for root in roots):
+        raise ValueError(f"{host}: AIA ara sertifikası güvenilir bir köke bağlanmıyor")
+    now = datetime.now(timezone.utc)
+    if not intermediate.not_valid_before_utc <= now <= intermediate.not_valid_after_utc:
+        raise ValueError(f"{host}: AIA ara sertifikasının süresi geçerli değil")
+
+    bundle = Path(tempfile.gettempdir()) / f"rationai_ca_{host}.pem"
+    bundle.write_bytes(roots_pem + b"\n" + intermediate.public_bytes(Encoding.PEM))
+    logger.info("%s: eksik ara sertifika AIA'dan tamamlandı (%s)", host, intermediate.subject.rfc4514_string())
+    return str(bundle)
 
 
 @dataclass
@@ -115,6 +224,11 @@ def _parse_turkish_number(text: str) -> List[float]:
         pass
 
     return [c for c in candidates if c > 0]
+
+
+def _tr_upper(text: str) -> str:
+    """Türkçe büyük harf: str.upper() "Kepeği"yi "KEPEĞI" (noktasız) yapar, eşleşme kaçar."""
+    return text.replace("i", "İ").replace("ı", "I").upper()
 
 
 def _parse_date(text: str) -> Optional[datetime]:
@@ -169,13 +283,23 @@ class TurkishFeedPriceScraper:
         low, high = base * PRICE_SANITY_MIN_FACTOR, base * PRICE_SANITY_MAX_FACTOR
         return next((c for c in candidates if low <= c <= high), None)
 
+    def _get(self, url: str, **kwargs) -> requests.Response:
+        """GET; sertifika zinciri eksikse ara sertifikayı AIA'dan tamamlayıp bir kez daha dener."""
+        try:
+            return self.session.get(url, timeout=self.timeout, **kwargs)
+        except requests.exceptions.SSLError:
+            if self.session.verify is not True:
+                raise  # paket zaten tamamlanmış, sorun başka
+            self.session.verify = _aia_ca_bundle(urlparse(url).hostname, self.timeout)
+            return self.session.get(url, timeout=self.timeout, **kwargs)
+
     def scrape_exchange(self, code: str, label: str) -> List[FeedPrice]:
         """Tek bir borsanın fiyat tablosunu çeker."""
         prices: List[FeedPrice] = []
         cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
 
         try:
-            resp = self.session.get(TOBB_BASE_URL, params={"borsakod": code}, timeout=self.timeout)
+            resp = self._get(TOBB_BASE_URL, params={"borsakod": code})
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
             table = BeautifulSoup(resp.text, "html.parser").find("table")
@@ -214,32 +338,129 @@ class TurkishFeedPriceScraper:
 
         return prices
 
-    def scrape_all(self) -> Dict[str, FeedPrice]:
-        """Tüm borsaları gezip yem başına medyan fiyatı döndürür."""
+    def scrape_samsun(self) -> List[FeedPrice]:
+        """Samsun TB ürün sayfalarından kepek, saman ve küspe fiyatlarını çeker.
+
+        Her ürün için tablodaki EN YENİ "Satım" satırı alınır; `MAX_PRICE_AGE_DAYS`'ten
+        eskiyse ürün atlanır (soya küspesinde son işlem bir yıl önce olabiliyor).
+        "Müstahsil" satırları atlanır: üreticinin tarlada (çoğu zaman balyasız) sattığı
+        fiyattır, işletmenin tüccardan alış fiyatını yansıtmaz — samanda 2.21 TL/kg'a
+        karşı piyasa 3.50 TL/kg.
+        """
+        prices: List[FeedPrice] = []
+        cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
+        try:
+            index = self._get(f"{SAMSUN_BASE_URL}/urunler/")
+            index.raise_for_status()
+            index.encoding = index.apparent_encoding or "utf-8"
+            pages: Dict[str, str] = {}
+            for link in BeautifulSoup(index.text, "html.parser").find_all("a", href=True):
+                name = _tr_upper(re.sub(r"\s+", " ", link.get_text(" ", strip=True)))
+                name = name.replace("( ", "(").replace(" )", ")")
+                # Bağlantı metni adın ardından kod ve fiyat da taşır:
+                # "Buğday Kepeği Dökme BUGKEPDOK (SATIM) 13,64 En Az: ..."
+                feed_name = next((feed for key, feed in SAMSUN_PRODUCTS.items()
+                                  if name.startswith(key)), None)
+                if feed_name and "/piyasa-verileri/" in link["href"]:
+                    pages.setdefault(feed_name, link["href"])
+        except Exception as exc:
+            logger.warning("Samsun TB ürün listesi çekilemedi: %s", exc)
+            return prices
+
+        for feed_name, url in pages.items():
+            try:
+                resp = self._get(url if url.startswith("http") else SAMSUN_BASE_URL + url)
+                resp.raise_for_status()
+                resp.encoding = resp.apparent_encoding or "utf-8"
+                table = BeautifulSoup(resp.text, "html.parser").find("table")
+                rows = [[c.get_text(" ", strip=True) for c in tr.find_all("td")]
+                        for tr in (table.find_all("tr") if table else [])]
+                dated = [(d, r) for r in rows if len(r) >= 4 and (d := _parse_date(r[0]))
+                         and not (len(r) >= 6 and r[5].strip().lower().startswith("müstahsil"))]
+                if not dated:
+                    continue
+                traded_at, row = max(dated, key=lambda item: item[0])
+                if traded_at < cutoff:
+                    continue
+                price = self._plausible_price(feed_name, _parse_turkish_number(row[3]))
+                if price is None:
+                    continue
+                prices.append(FeedPrice(
+                    name=feed_name,
+                    price_per_kg=round(price, 2),
+                    source="Samsun TB",
+                    date=traded_at.date().isoformat(),
+                ))
+            except Exception as exc:
+                logger.warning("Samsun TB %s çekilemedi: %s", feed_name, exc)
+        return prices
+
+    def scrape_hayvanci(self) -> List[FeedPrice]:
+        """hayvanci.com piyasa fiyatı sayfalarından en yeni tarihli fiyatı çeker."""
+        prices: List[FeedPrice] = []
+        cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
+        for slug, feed_names in HAYVANCI_PRODUCTS.items():
+            try:
+                resp = self._get(f"{HAYVANCI_BASE_URL}/{slug}")
+                resp.raise_for_status()
+                resp.encoding = resp.apparent_encoding or "utf-8"
+                table = BeautifulSoup(resp.text, "html.parser").find("table")
+                rows = [[c.get_text(" ", strip=True) for c in tr.find_all("td")]
+                        for tr in (table.find_all("tr") if table else [])]
+                dated = [(d, r) for r in rows if len(r) >= 2 and (d := _parse_date(r[0]))]
+                if not dated:
+                    continue
+                traded_at, row = max(dated, key=lambda item: item[0])
+                # "3,50 TL/kg" — birim TL/kg değilse tahmin yürütme.
+                if traded_at < cutoff or "TL/KG" not in _tr_upper(row[1]).replace(" ", ""):
+                    continue
+                value = _tr_upper(row[1]).replace("TL/KG", "")
+                for feed_name in feed_names:
+                    price = self._plausible_price(feed_name, _parse_turkish_number(value))
+                    if price is not None:
+                        prices.append(FeedPrice(
+                            name=feed_name, price_per_kg=round(price, 2),
+                            source="hayvanci.com", date=traded_at.date().isoformat(),
+                        ))
+            except Exception as exc:
+                logger.warning("hayvanci.com %s çekilemedi: %s", slug, exc)
+        return prices
+
+    def scrape_all(self, feed_types: Optional[Dict[str, str]] = None) -> Dict[str, FeedPrice]:
+        """Tüm kaynakları gezip yem başına İŞLETME TESLİM fiyatını döndürür.
+
+        Piyasa fiyatı = kaynak örneklerinin medyanı; üstüne yem tipine göre
+        `DELIVERY_PREMIUM_TL_KG` eklenir. Kaynak etiketi hesabı açıkça taşır:
+        "piyasa 3.50 + teslim 1.20 · hayvanci.com".
+        """
+        feed_types = feed_types or {}
         collected: Dict[str, List[FeedPrice]] = {}
 
         for code, label in TOBB_EXCHANGES.items():
             for price in self.scrape_exchange(code, label):
                 collected.setdefault(price.name, []).append(price)
+        for price in self.scrape_samsun() + self.scrape_hayvanci():
+            collected.setdefault(price.name, []).append(price)
 
         results: Dict[str, FeedPrice] = {}
         for feed_name, samples in collected.items():
-            median_price = statistics.median(p.price_per_kg for p in samples)
+            market = statistics.median(p.price_per_kg for p in samples)
+            premium = DELIVERY_PREMIUM_TL_KG.get(feed_types.get(feed_name, ""), 0.0)
             newest = max(samples, key=lambda p: p.date)
-            sources = {p.source for p in samples}
-            label = newest.source
-            if len(sources) > 1:
-                label = f"{newest.source} (+{len(sources) - 1} borsa)"
+            sources = sorted({p.source for p in samples}, key=lambda src: src != newest.source)
+            label = sources[0] + (f" +{len(sources) - 1} kaynak" if len(sources) > 1 else "")
+            if premium:
+                label = f"piyasa {market:.2f} + teslim {premium:.2f} · {label}"
 
             results[feed_name] = FeedPrice(
                 name=feed_name,
-                price_per_kg=round(median_price, 2),
+                price_per_kg=round(market + premium, 2),
                 source=label,
                 date=newest.date,
                 sample_count=len(samples),
             )
 
-        logger.info("TOBB: %d yem için canlı fiyat bulundu", len(results))
+        logger.info("Canlı kaynaklar: %d yem için teslim fiyatı bulundu", len(results))
         return results
 
 
@@ -251,6 +472,11 @@ def _curated_base_prices() -> Dict[str, float]:
     """Taban fiyatlar tek kaynaktan: küratörlü yem tablosu."""
     from .database import _get_curated_feeds
     return {feed["name"]: feed["price_per_kg"] for feed in _get_curated_feeds()}
+
+
+def _curated_feed_types() -> Dict[str, str]:
+    from .database import _get_curated_feeds
+    return {feed["name"]: feed["feed_type"] for feed in _get_curated_feeds()}
 
 
 def update_feed_prices(
@@ -268,16 +494,19 @@ def update_feed_prices(
         Canlı kaynak bulunamazsa fiyatlara DOKUNULMAZ ve live_count 0 döner —
         eskiden burada sessizce rastgele bir simülasyon çalışıyordu.
     """
+    from .database import MANUAL_SOURCE
+
     now = datetime.now()
     updated: List[Feed] = []
+    kept_manual: List[str] = []
 
     if price_updates is not None:
-        source_label = "elle girildi"
+        source_label = MANUAL_SOURCE
         resolved = {name: (price, source_label, now) for name, price in price_updates.items()}
     else:
         scraper = TurkishFeedPriceScraper(base_prices=_curated_base_prices())
-        scraped = scraper.scrape_all()
-        source_label = "TOBB borsa"
+        scraped = scraper.scrape_all(_curated_feed_types())
+        source_label = "TOBB + Samsun TB + hayvanci.com"
         resolved = {
             name: (fp.price_per_kg, f"{fp.source} · {fp.date}", now)
             for name, fp in scraped.items()
@@ -287,6 +516,11 @@ def update_feed_prices(
         feed = db.query(Feed).filter(Feed.name == feed_name).first()
         if feed is None:
             logger.warning("Veritabanında bulunmayan yem atlandı: %s", feed_name)
+            continue
+        # Çiftçinin kaydettiği alış fiyatı piyasa ortalamasından daha doğrudur: canlı
+        # senkron onu ezmez. Piyasaya dönmek için `reset_manual_prices()`.
+        if price_updates is None and feed.price_source == MANUAL_SOURCE:
+            kept_manual.append(feed_name)
             continue
         logger.debug("%s: %.2f -> %.2f (%s)", feed_name, feed.price_per_kg or 0, new_price, source)
         feed.price_per_kg = new_price
@@ -301,13 +535,32 @@ def update_feed_prices(
     return {
         "updated": updated,
         "live_count": len(updated),
-        "baseline_count": max(total_feeds - len(updated), 0),
+        "baseline_count": max(total_feeds - len(updated) - len(kept_manual), 0),
         "source": source_label,
+        "kept_manual": kept_manual,
     }
+
+
+def reset_manual_prices(db: Session) -> List[str]:
+    """Elle girilen fiyatları küratörlü taban fiyata döndürür (sonraki senkron günceller)."""
+    from .database import BASELINE_PRICE_DATE, BASELINE_SOURCE, MANUAL_SOURCE
+
+    base = _curated_base_prices()
+    reset = []
+    for feed in db.query(Feed).filter(Feed.price_source == MANUAL_SOURCE).all():
+        if feed.name in base:
+            feed.price_per_kg = base[feed.name]
+            feed.price_source = BASELINE_SOURCE
+            feed.price_updated_at = BASELINE_PRICE_DATE
+            reset.append(feed.name)
+    if reset:
+        db.commit()
+    return reset
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    for name, fp in sorted(TurkishFeedPriceScraper(base_prices=_curated_base_prices()).scrape_all().items()):
+    scraper = TurkishFeedPriceScraper(base_prices=_curated_base_prices())
+    for name, fp in sorted(scraper.scrape_all(_curated_feed_types()).items()):
         print(f"{name:<12} {fp.price_per_kg:>7.2f} TL/kg  {fp.source} · {fp.date} "
               f"({fp.sample_count} kayıt)")
