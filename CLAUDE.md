@@ -134,7 +134,7 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
 | `POST` | `/api/v1/requirements` | NASEM 2021 targets for an `AnimalProfileIn` + the group's NDF/forage windows (the sidebar reads this) |
 | `POST` | `/api/v1/optimize` | **Deterministic ration optimization** — the Streamlit "Calculate" button uses this; no LLM involved. With `animal`, empty targets are filled from the requirements and the group's rules apply |
 | `POST` | `/api/v1/agent/query` | Free-text ration questions through the LangGraph agent. **503 when `GROQ_API_KEY` is unset** — the only endpoint that needs it |
-| `POST` | `/api/v1/feeds/sync-prices` | Live market price sync (TOBB + Samsun TB); a JSON list body instead saves the user's own prices as `"elle girildi"` |
+| `POST` | `/api/v1/feeds/sync-prices` | Live delivered-price sync (TOBB + Samsun TB + hayvanci.com, + delivery premium); a JSON list body instead saves the user's own prices as `"elle girildi"` |
 | `POST` | `/api/v1/feeds/reset-prices` | Returns saved (`"elle girildi"`) prices to the curated baseline |
 
 ## Architecture Notes
