@@ -12,6 +12,11 @@ __pycache__/
 rationai.db
 data/chroma_db/
 
+# Defter fotoğrafları kişisel — repoya sadece düz metin dökümü (data/notlar/*.md) girer.
+data/notlar/*.jpeg
+data/notlar/*.jpg
+data/notlar/*.png
+
 # Araç/IDE
 .claude/
 .idea/
