@@ -1,3 +1,38 @@
+# RationAI teması: yeşil tonlu, sade; açık ve koyu mod (ayarlar menüsünden seçilir).
+# Görünüm yalnızca buradan ayarlanır — uygulamada elle yazılmış CSS yok.
+
 [theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+baseFontSize = 15
+headingFontSizes = ["30px", "22px", "18px", "16px", "15px", "14px"]
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+baseRadius = "10px"
+buttonRadius = "8px"
+showWidgetBorder = true
+showSidebarBorder = false
+linkUnderline = false
+chartCategoricalColors = ["#2E7D32", "#8BC34A", "#F9A825", "#6D4C41", "#26A69A", "#EF6C00", "#5C6BC0", "#AD1457", "#78909C"]
+
+[theme.light]
 primaryColor = "#2E7D32"
-font = "sans-serif"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F6F0"
+textColor = "#1C2A1F"
+borderColor = "#DFE7DB"
+greenColor = "#2E7D32"
+
+[theme.light.sidebar]
+backgroundColor = "#F5F8F3"
+secondaryBackgroundColor = "#EAF0E6"
+
+[theme.dark]
+primaryColor = "#66BB6A"
+backgroundColor = "#0F1511"
+secondaryBackgroundColor = "#1A231D"
+textColor = "#E6EEE7"
+borderColor = "#2B372E"
+greenColor = "#66BB6A"
+
+[theme.dark.sidebar]
+backgroundColor = "#131B16"
+secondaryBackgroundColor = "#1C2620"

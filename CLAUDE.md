@@ -1,7 +1,7 @@
 # RationAI Project
 
 ## Overview
-RationAI is an AI-powered animal nutrition assistant that helps formulate optimal feed rations. It combines a FastAPI backend with a LangChain-based agent using Groq's LLM, a ChromaDB knowledge base for document retrieval, and linear programming (PuLP) for ration optimization. The system can ingest nutritional documents, answer queries about animal nutrition, retrieve feed ingredient data from a PostgreSQL/SQLite database, and compute cost‑optimal rations that satisfy user‑specified nutrient constraints.
+RationAI is an AI-powered animal nutrition assistant that helps formulate optimal feed rations. It combines a FastAPI backend with a tool-calling chat agent (NVIDIA NIM or Groq, OpenAI-compatible API), a ChromaDB knowledge base for document retrieval, and linear programming (PuLP) for ration optimization. The system can ingest nutritional documents, answer queries about animal nutrition, retrieve feed ingredient data from a PostgreSQL/SQLite database, and compute cost‑optimal rations that satisfy user‑specified nutrient constraints.
 
 ---
 
@@ -45,7 +45,7 @@ rationai/
 │   └── app/
 │       ├── __init__.py
 │       ├── main.py            # FastAPI entry point and API routes
-│       ├── agent.py           # LangGraph agent: state graph, tools, manual tool parsing
+│       ├── agent.py           # Chat agent: OpenAI-compatible API (NVIDIA NIM / Groq), native tool calls
 │       ├── optimization.py    # PuLP‑based ration optimization logic + infeasibility diagnosis
 │       ├── compound_feed.py   # Karma yem (concentrate) formulation: 1 t batch, AS‑FED targets
 │       ├── economics.py       # Besi ekonomisi: cost / revenue / profit of one fattening period
@@ -66,9 +66,10 @@ rationai/
 │       └── Yem Tablosu.md
 ├── frontend/
 │   ├── Dockerfile             # python:3.14-slim; streamlit only, no chromadb/langchain
-│   └── app.py                 # Streamlit UI — daily ration + karma yem modes, flat script (no `main()`)
+│   ├── app.py                 # Streamlit UI — 3 pages in a top menu + "Asistan" chat dialog
+│   └── assets/                # logo.svg / icon.svg for st.logo
 ├── .streamlit/
-│   └── config.toml            # Streamlit theme (green primary); replaces hand‑written CSS
+│   └── config.toml            # Theme: green light + dark modes, Inter font, radii; no CSS anywhere
 ├── rationai.db                # Local SQLite database (default `DATABASE_URL`)
 ├── quickstart.py              # Cross‑platform launcher (seed → ingest → backend + frontend)
 ├── kill_ports.ps1             # Windows helper: kill whatever is listening on port 8000
@@ -84,8 +85,10 @@ A `.env` file in the project root must contain the following variables:
 | Variable | Example Value | Description |
 |---|---|---|
 | `DATABASE_URL` | `sqlite:///rationai.db` (current) or `postgresql://postgres:123456@localhost:5432/rationai` | Database connection string |
-| `GROQ_API_KEY` | `gsk_...` | API key for Groq (`langchain_groq.ChatGroq`) — optional |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` (default) | Groq model; Groq retires models (`llama-3.3-70b-versatile` now 404s), so this is overridable |
+| `NVIDIA_API_KEY` | `nvapi-...` | NVIDIA NIM (build.nvidia.com) key for the chat — optional; preferred when set |
+| `GROQ_API_KEY` | `gsk_...` | Groq key for the chat — optional fallback |
+| `LLM_PROVIDER` | `nvidia` / `groq` | Forces a provider; empty = first one with a key (nvidia, then groq) |
+| `LLM_MODEL` | `nvidia/nemotron-3.5-super-vl-120b-a12b` (nvidia default) | Model override; providers retire models (404), so it is not hard-coded. `GROQ_MODEL` is still read for Groq |
 | `PRICE_AUTO_SYNC` | `1` (default) / `0` | Daily background price sync (feeds + carcass/slaughter prices). Set `0` in test harnesses and offline — TestClient runs the lifespan too |
 
 ## Getting Started & Execution Commands
@@ -141,7 +144,7 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
 | `POST` | `/api/v1/optimize` | **Deterministic ration optimization** — the Streamlit "Calculate" button uses this; no LLM involved. With `animal`, empty targets are filled from the requirements and the group's rules apply |
 | `GET` | `/api/v1/compound-feed/types` | Karma yem presets from the user's CP → ME table (as‑fed targets, Ca/P draft ranges) |
 | `POST` | `/api/v1/compound-feed` | Cheapest compound‑feed batch (default 1000 kg) for a preset or custom CP/ME target |
-| `POST` | `/api/v1/agent/query` | Free-text ration questions through the LangGraph agent. **503 when `GROQ_API_KEY` is unset** — the only endpoint that needs it |
+| `POST` | `/api/v1/agent/query` | Chat: `query` + `history` + `context` (the result on screen). Answers with `answer`, `sources`, `tools_used`, `result` ({kind, data} of a calculation). **503 without an LLM key** — the only endpoint that needs one |
 | `POST` | `/api/v1/feeds/sync-prices` | Live delivered-price sync (TOBB + Samsun TB + hayvanci.com, + delivery premium); a JSON list body instead saves the user's own prices as `"elle girildi"` |
 | `POST` | `/api/v1/feeds/reset-prices` | Returns saved (`"elle girildi"`) prices — feeds and slaughter prices — to the curated baseline |
 | `GET` | `/api/v1/market-prices` | Slaughter (carcass) prices, TL/kg: Türkiye average + UKON regions (`"<key>@<Bölge>"`), with source and date |
@@ -165,8 +168,18 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
   `http://localhost:8000/api/v1` so the non‑Docker `quickstart.py` flow keeps working; compose
   sets `http://backend:8000/api/v1`). It imports nothing from `backend/` — that is why its image
   needs neither chromadb nor langchain.
-- **Frontend is deliberately minimal** (dairy, beef and lamb groups). `frontend/app.py` is a flat script
-  (no `main()` wrapper) using native Streamlit components — no hand‑written CSS, no
+- **Frontend layout:** `st.navigation(position="top")` with three `st.Page` callables —
+  `render_ration_page`, `render_compound_feed_page`, `render_economics_page` (the old sidebar
+  "Ne hesaplayalım?" control is gone; the sidebar holds each page's inputs only). `st.logo`
+  shows `frontend/assets/logo.svg`. Every page starts with `page_header()`: title + an
+  **"Asistan"** button (hidden without an LLM key) that opens `assistant_dialog()` — a large
+  `st.dialog` with the chat. Look and feel come only from `.streamlit/config.toml` (light +
+  dark themes, Inter, radii); keep it that way. Programmatic page changes go through the
+  `goto` session key → `st.switch_page()` before `page.run()`; the dialog is opened by the
+  `open_assistant` flag **after** `page.run()` (only one dialog per run, and a button inside a
+  page can't open it directly before the page finishes).
+- **Frontend is deliberately minimal** (dairy, beef and lamb groups). `frontend/app.py` uses
+  native Streamlit components — no hand‑written CSS, no
   `unsafe_allow_html`, no Plotly (the one chart is an Altair donut). `use_container_width`
   is deprecated in Streamlit 1.60; use `width="stretch"`. The sidebar collects an animal
   profile (group segmented control; milk details behind "Hayvan detayları") and shows the
@@ -296,25 +309,54 @@ Free port 8000 if a stale uvicorn is holding it (Windows):
   (`ration_forages`/`ration_concentrates`/`minerals_*`, `compound_*`, `econ_*`) and sets an
   `auto_calc_*` flag so the next run recalculates. Write texts without Turkish suffixes after
   numbers ("%8'ında" was wrong) — phrase around them.
-- **Agent flow:** `run_agent()` → LangGraph `agent → tool_executor → END`. The LLM does *not* use
-  native function calling; `agent_node` prompts for a JSON tool call and `tool_executor_node`
-  parses it manually. Tools are plain functions in `TOOLS` returning `(text, structured|None)`:
-  `search_knowledge_base`, `get_feed_data`, `calculate_ration`. `calculate_ration` takes the
-  animal (`animal_weight`, `milk_yield`, `group`, `days_in_milk`, `fat_pct`, `days_pregnant`,
-  `first_lactation`, and for beef/lamb `daily_gain` — default 1.4 / 0.3 kg — and `days_on_feed`)
-  and computes the targets with `compute_requirements()`; `constraints`
-  only overrides keys the user stated. With no matching feed names it uses every feed
-  (nothing forced); with no mineral named it adds the UI's default minerals (the lamb set for
-  `group="lamb"`). The system prompt lists the real feed names from the DB — do not hard-code them.
-  `gpt-oss` sometimes leaves `content` empty and puts the JSON at the end of
-  `reasoning_content`; `agent_node` reads it from there but never shows raw reasoning.
-  ⚠️ It also sometimes answers a ration request **without the tool**, writing feed amounts
-  itself or claiming the tool is unavailable. Those amounts meet no constraint: when a ration
-  request (`_RATION_REQUEST`) gets a direct answer with kg amounts (`_SUSPECT_ANSWER`),
-  `agent_node` retries once with a reminder and otherwise refuses — never shows them.
-  Groq's free tier is ~8000 tokens/min and one call is ~2000, so back‑to‑back tests hit 429.
-  Tool output goes to the user verbatim (no second LLM pass), so a knowledge-base hit is shown
-  as the raw chunk.
+- **Agent flow (`agent.py`)** — no LangChain/LangGraph: `requests` against an **OpenAI‑compatible
+  `/chat/completions`** with **native tool calling** (`TOOL_SPECS`). Provider from `PROVIDERS`
+  (NVIDIA NIM `integrate.api.nvidia.com/v1`, Groq `api.groq.com/openai/v1`), chosen by
+  `LLM_PROVIDER` or the first key present; model by `LLM_MODEL`. `run_agent(query, history,
+  context)`: system prompt + the summary of the result on screen (`context`, via
+  `SUMMARIZERS`) + the last `HISTORY_TURNS` turns + the question; up to `MAX_TOOL_ROUNDS` tool
+  rounds, then the model answers **in its own words** (tool text goes back to the model, not
+  to the user). Tools: `search_knowledge_base` (chunks tagged with their source file; the
+  file names come back as `sources`), `get_feed_data`, `calculate_ration`,
+  `design_compound_feed`, `fattening_economics`. The three calculation tools call the
+  **same endpoint functions as the UI buttons** (`main.optimize`, `main.compound_feed`,
+  `main.fattening_economics`, imported lazily — main imports agent) with `with_advice=True`,
+  feed names matched by `_match_feed_names` (exact → alias → longest substring → word
+  prefixes, aliases first, so "ayçiçek küspesi" → ATK 36 and "arpa hasılı" → the silage),
+  and return `{"kind", "data"}` (data also carries `request` so the UI can reopen it) — the
+  UI renders it with the normal result components. Summaries state the outcome in words
+  (`_MODE_TEXT`: "BÜTÜN hedefler SAĞLANDI" / "HEPSİ TUTMADI", failing targets by name): with
+  "mode=relaxed (hard = …)" the model once told the user all targets were met when the
+  protein ceiling was not. If a calculation request (`_RATION_REQUEST`) is answered without a
+  tool but with kg/TL figures (`_SUSPECT_ANSWER`), it is retried once with `_TOOL_REMINDER`,
+  then refused — never shown. `<think>` blocks are stripped. `max_tokens` is 4000: reasoning
+  models spend tokens before answering and 1500 cut answers mid‑sentence.
+  **Model choice (Oct 2026, NIM free tier):** `nemotron-3.5-super-vl-120b-a12b` — Turkish OK,
+  tool calls in ~3 s, knowledge answers 8–15 s. `nemotron-3-ultra-550b` had the best Turkish
+  but 30–50 s; `nemotron-3.5-lightning-30b` picked wrong tool arguments; `gpt-oss-20b` answered
+  factually wrong; Nemotron 3 Super, Kimi K2.6, Nano, Mistral Large returned 404 for the
+  account; Gemma 4 / DeepSeek V4.1 / GLM timed out. NIM's free tier is for development —
+  production use needs a licence, so keep the provider switchable.
+- **Knowledge base (`rag.py`)** indexes `data/docs/*.md` plus `EXTRA_FILES`
+  (`data/notlar/rasyon_notlari.md`). ⚠️ ChromaDB's default embedding (all‑MiniLM‑L6‑v2) is
+  English: for "kuruda yonca neden verilmez?" it returned the table of contents. So
+  `query_with_sources()` ranks **Turkish keyword matches first** (lower‑cased words cut to
+  5‑letter stems, stop words dropped, all chunks cached in memory) and fills up with the
+  vector hits. `data/docs/RationAI Kuralları.md` explains the program's
+  own rules **with their reasons** in Turkish ("kuruda yonca neden yok?") — keep it in sync
+  when a rule changes. The Dockerfile copies the notes file; `.dockerignore` excludes only the
+  photos.
+- **Chat UI** — the "Asistan" dialog (`assistant_dialog()`, a fragment: sending a message reruns
+  only the dialog): example questions as `st.pills`, `st.chat_message` history in a fixed‑height
+  container (`st.session_state["chat"]`), the last calculation result becomes `chat_context`, results are
+  drawn with `render_results` / `render_compound_result(actionable=False)` /
+  `render_economics_result(actionable=False)` (advice without "Uygula" buttons), and
+  "… ekranında aç" (`_open_in_screen`, a plain button followed by `st.rerun()` — a callback
+  would only rerun the dialog) writes the inputs into the page's widget keys
+  (`ration_group`, `bw_*`, `milk_kg`, `gain_*`, `days_on_feed`, `compound_type`,
+  `compound_batch`, `econ_*`, feed boxes), sets `goto` and the `auto_calc_*` flag. Every result
+  has "Bu sonuç hakkında sor" (`render_ask_box`, hidden without an LLM key): it stores the
+  question and the result (with its `request`) and opens the dialog.
 - **Structured results:** the optimizer's `OptimizationResult` is converted to the API‑facing
   `OptimizationResponse` by `optimization_result_to_schema()` in `optimization.py`, shared by
   both the endpoint and the agent tool. `format_result_for_agent()` is the text form.
@@ -535,12 +577,12 @@ solve as "Feasible (soft constraint cozumu)" — it once reported 73 kg of silag
   the model infeasible. It is expensive‑soft, not hard: a feed that truly conflicts with the
   nutrient targets is dropped and reported in `solver_details["dropped_feeds"]`.
 
-## The Groq key is optional — keep it that way
-`agent.py` builds the LLM **lazily** (`_get_llm()`, cached; `llm_available()` just checks the env
-var). Never construct `ChatGroq` at module import: it raises without `GROQ_API_KEY`, and because
-`main.py` imports `agent.py`, that once took the entire backend down — including the deterministic
-`/optimize` path, which never touches an LLM. Anyone cloning the repo must get a working app
-without signing up for anything; only `/api/v1/agent/query` answers 503.
+## The LLM key is optional — keep it that way
+`agent.py` touches no network at import; `llm_available()` only checks the env vars. (A
+`ChatGroq` built at import once took the entire backend down without a key — including the
+deterministic `/optimize` path, which never touches an LLM.) Anyone cloning the repo must get a
+working app without signing up for anything; only `/api/v1/agent/query` answers 503, and the
+UI hides the chat box / shows a warning.
 
 Same reasoning applies to startup: `create_all()` + seeding live in the **lifespan** handler with a
 retry loop (`_prepare_database()`), not at import. Postgres reports healthy slightly before it

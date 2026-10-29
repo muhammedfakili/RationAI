@@ -1,48 +1,42 @@
-"""
-Agent module for RationAI - LLM-driven agent using Groq with manual tool parsing.
+"""Sohbet ajanı: OpenAI uyumlu bir sohbet API'si (NVIDIA NIM ya da Groq) + yerel araç çağırma.
 
-The LLM does not use native function calling: `agent_node` asks for a JSON tool call
-and `tool_executor_node` parses and runs it. Graph: agent -> tool_executor -> END.
+Akış: sistem mesajı + sohbet geçmişi + (varsa) ekrandaki son sonucun özeti + kullanıcı
+mesajı → model ya araç çağırır ya cevap verir. Araç sonuçları modele geri verilir, model
+en fazla MAX_TOOL_ROUNDS tur sonra kendi cümleleriyle cevaplar.
+
+⚠️ Hesap araçları ekrandaki düğmelerle AYNI uç nokta fonksiyonlarını çağırır (main.optimize,
+main.compound_feed, main.fattening_economics; öneriler dahil). Rakamlar her zaman çözücüden
+gelir — model rasyon miktarı uyduramaz; uydurursa bir kez uyarılıp yeniden sorulur, yine
+olmazsa cevap reddedilir.
+
+Sağlayıcı `.env`'den seçilir (LLM_PROVIDER; yoksa anahtarı olan ilk sağlayıcı) ve model
+LLM_MODEL ile değiştirilebilir. Anahtar yoksa backend'in geri kalanı çalışmaya devam eder,
+yalnız /api/v1/agent/query 503 döner.
 """
 
 import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
-from langgraph.graph import END, StateGraph
+import requests
 
 from .database import SessionLocal
 from .models import Feed
-from .optimization import (
-    RULES_BY_GROUP,
-    NutrientConstraints,
-    feeds_from_db,
-    format_result_for_agent,
-    optimization_result_to_schema,
-    optimize_ration,
-)
-from .rag import query_documents
-from .requirements import (
-    AnimalProfile,
-    GROWTH_GROUPS,
-    annotate_growth_result,
-    compute_requirements,
-    requirements_to_constraints,
-    rules_for,
-)
+from .optimization import NutrientConstraints, RULES_BY_GROUP
+from .rag import query_with_sources
 from .schemas import AgentResponse
 
 logger = logging.getLogger(__name__)
 
-# Minerals the UI pre-selects; added when the LLM names no mineral, otherwise Ca/P
+# Minerals the UI pre-selects; added when the user names no mineral, otherwise Ca/P
 # can only come from forages and the ration lands in relaxed mode.
 DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz", "Vitamin-Mineral Premiks")
 # Kuzu: sığır premiksi yok (bakır), DCP yok (Ca:P ≥ 2), amonyum klorür var (idrar taşı).
 DEFAULT_LAMB_MINERALS = ("Mermer Tozu", "Tuz", "Koyun Premiksi (Bakırsız)", "Amonyum Klorür")
+DEFAULT_COMPOUND_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz", "Vitamin-Mineral Premiks")
 
 # Short or English names the LLM sometimes uses -> database name. The short Turkish
 # names matter: substring matching sent "yonca" to whichever alfalfa feed came first
@@ -68,8 +62,10 @@ _FEED_ALIASES = {
     "pancar posası": "Şeker Pancarı Posası",
     "ddgs": "Mısır DDGS",
     "bypass yağ": "Korunmuş Yağ (Bypass)",
+    "yağ": "Bitkisel Yağ",
     "mermer tozu": "Mermer Tozu",
     "dcp": "DCP (Dikalsiyum Fosfat)",
+    "premiks": "Vitamin-Mineral Premiks",
     "corn": "Mısır",
     "wheat": "Buğday",
     "barley": "Arpa",
@@ -105,11 +101,6 @@ _CONSTRAINT_FIELDS = {
 }
 
 ToolResult = Tuple[str, Optional[Dict[str, Any]]]
-
-
-class AgentState(TypedDict):
-    messages: List[HumanMessage | AIMessage]
-    context: Dict[str, Any]
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -152,378 +143,506 @@ def parse_constraints(raw: Any, expected_dm_intake_kg: Optional[float] = None) -
     return NutrientConstraints(**values)
 
 
+def _words(text: str) -> List[str]:
+    return re.findall(r"[a-zçğıöşü0-9]+", text.replace("I", "ı").replace("İ", "i").lower())
+
+
 def _match_feed_names(requested: List[str], all_names: List[str]) -> List[str]:
-    """Map LLM feed names onto database names: exact, English alias, then substring."""
+    """Map LLM feed names onto database names: exact, alias, substring, then word prefixes.
+
+    The last step catches spelling variants: "ayçiçek küspesi" -> "Ayçiçeği Küspesi 36"
+    (every word of the request, minus 1-2 letters, starts a word of the feed name).
+    """
     by_lower = {name.lower(): name for name in all_names}
     by_lower.update({alias: name for alias, name in _FEED_ALIASES.items() if name in all_names})
     matched: List[str] = []
     for name in requested:
-        key = name.lower()
-        hit = by_lower.get(key) or next(
-            (canonical for lower, canonical in by_lower.items() if key in lower or lower in key), None
-        )
+        key = name.lower().strip()
+        # Birden çok ad içeriyorsa en uzunu: "arpa hasılı" -> "Arpa Hasılı Silajı", "Arpa" değil.
+        hit = by_lower.get(key) or max(
+            ((lower, canonical) for lower, canonical in by_lower.items() if key in lower or lower in key),
+            key=lambda item: len(item[0]), default=(None, None))[1]
+        if hit is None:
+            stems = [w[:max(3, len(w) - 2)] for w in _words(key)]
+            # Takma adlar önce: derecesiz "ayçiçek" ATK 36'ya gider (ATK 24'e değil).
+            aliases_first = [(a, c) for a, c in _FEED_ALIASES.items() if c in all_names] + list(by_lower.items())
+            hit = next((canonical for lower, canonical in aliases_first
+                        if stems and all(any(word.startswith(st) for word in _words(lower)) for st in stems)),
+                       None)
         if hit and hit not in matched:
             matched.append(hit)
     return matched
 
 
+def _as_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [n.strip() for n in value.split(",") if n.strip()]
+    return [str(n).strip() for n in (value or []) if str(n).strip()]
+
+
 # ============================================================
-# Tools — each returns (text for the user, structured optimization result or None)
+# Sonuç özetleri — hem araç çıktısı (modele) hem "bu sonuç hakkında sor" bağlamı
 # ============================================================
 
-def search_knowledge_base(query: str) -> ToolResult:
-    results = query_documents(query_text=query, n_results=3)
-    return ("\n\n".join(results) if results else "Bilgi tabanında ilgili bilgi bulunamadı."), None
+_CONSTRAINT_LABEL = {
+    "crude_protein_min": "ham protein alt sınırı", "crude_protein_max": "ham protein üst sınırı",
+    "metabolic_energy_min": "enerji (ME) alt sınırı", "metabolic_energy_max": "enerji (ME) üst sınırı",
+    "calcium_min": "kalsiyum alt sınırı", "calcium_max": "kalsiyum üst sınırı",
+    "phosphorus_min": "fosfor alt sınırı", "phosphorus_max": "fosfor üst sınırı",
+}
+_MODE_TEXT = {
+    "hard": "BÜTÜN besin hedefleri ve rasyon kuralları SAĞLANDI.",
+    "relaxed": "Besin hedeflerinin HEPSİ TUTMADI (seçilen yemlerle en yakın rasyon). Bunu kullanıcıya açıkça söyle.",
+    "infeasible": "Bu yemlerle rasyon KURULAMADI.",
+}
 
 
-def get_feed_data() -> ToolResult:
+def summarize_ration(r: Dict[str, Any]) -> str:
+    sd, nc = r.get("solver_details") or {}, r.get("nutrient_content") or {}
+    small = (r.get("daily_intake") or {}).get("dry_matter_kg", 0) < 5
+    mode = sd.get("nutrition_mode")
+    lines = [f"SONUÇ: {_MODE_TEXT.get(mode, mode)}",
+             f"Günlük maliyet {r.get('total_cost_per_day', 0):.2f} TL, "
+             f"kuru madde {(r.get('daily_intake') or {}).get('dry_matter_kg', 0):.2f} kg/gün."]
+    if sd.get("energy_surplus") and mode == "hard":
+        lines.append("Enerji ihtiyacın üstünde (uyarıya bak); bu bir hedef ihlali sayılmaz.")
+    for f in r.get("feed_recommendations") or []:
+        amount = f"{f['amount_kg_per_day'] * 1000:.0f} g" if small else f"{f['amount_kg_per_day']:.2f} kg"
+        lines.append(f"- {f['name']}: {amount}/gün, {f['cost_per_day']:.2f} TL")
+    lines.append(
+        f"Besin değeri (KM): HP %{nc.get('crude_protein_percent_dm', 0):.1f}, ME "
+        f"{(nc.get('metabolic_energy_mcal_per_kg_dm') or 0) * 1000:.0f} kcal/kg, Ca "
+        f"{nc.get('calcium_g_per_kg_dm', 0):.1f} g/kg, P {nc.get('phosphorus_g_per_kg_dm', 0):.1f} g/kg, "
+        f"NDF %{nc.get('ndf_percent_dm') or 0:.1f}, kaba yem %{nc.get('forage_ratio_percent') or 0:.0f}, "
+        f"nişasta %{nc.get('starch_percent_dm') or 0:.1f}.")
+    bad = [f"{_CONSTRAINT_LABEL.get(c['constraint'], c['constraint'])} ({c['status']})"
+           for c in r.get("constraints_status") or [] if c.get("status") != "OK"
+           and not (mode == "hard" and c["constraint"] == "metabolic_energy_max")]
+    if bad:
+        lines.append("TUTMAYAN HEDEFLER: " + "; ".join(bad))
+    for w in (r.get("warnings") or [])[:3]:
+        lines.append(f"Uyarı: {w}")
+    for key in ("dropped_feeds", "excluded_feeds"):
+        if sd.get(key):
+            lines.append(f"{key}: {', '.join(sd[key])}")
+    for a in r.get("advice") or []:
+        lines.append(f"Öneri ({a['kind']}): {a['text']}")
+    return "\n".join(lines)
+
+
+def summarize_compound(r: Dict[str, Any]) -> str:
+    t = r.get("target") or {}
+    lines = [f"SONUÇ: {_MODE_TEXT.get(r.get('mode'), r.get('mode'))}",
+             f"Karma yem ({t.get('label')}): {r.get('batch_kg', 0):,.0f} kg, "
+             f"maliyet {r.get('cost_total', 0):,.0f} TL ({r.get('cost_per_kg', 0):.2f} TL/kg). "
+             f"HP %{r.get('cp_pct', 0):.2f} (hedef {t.get('cp_min')}-{t.get('cp_max')}), ME "
+             f"{r.get('me_kcal', 0):.0f} kcal/kg (hedef {t.get('me_min')}-{t.get('me_max')}), "
+             f"Ca %{r.get('ca_pct', 0):.2f}, P %{r.get('p_pct', 0):.2f}."]
+    for line in r.get("lines") or []:
+        lines.append(f"- {line['name']}: {line['amount_kg']:.1f} kg (%{line['share_pct']:.1f})")
+    for note in (r.get("notes") or [])[:4]:
+        lines.append(f"Not: {note}")
+    for a in r.get("advice") or []:
+        lines.append(f"Öneri ({a['kind']}): {a['text']}")
+    return "\n".join(lines)
+
+
+def summarize_economics(r: Dict[str, Any]) -> str:
+    ph, herd = r.get("per_head") or {}, r.get("herd") or {}
+    prices = r.get("prices") or {}
+    lines = [
+        f"Besi ekonomisi: {r.get('head_count')} baş, {r.get('start_weight_kg')} → {r.get('end_weight_kg', 0):.1f} kg, "
+        f"{r.get('days')} gün, karkas {r.get('carcass_weight_kg', 0):.1f} kg (randıman %{r.get('dressing_pct')}).",
+        f"Kesim fiyatı {(prices.get('carcass') or {}).get('price_per_kg', 0):.2f} TL/kg "
+        f"({(prices.get('carcass') or {}).get('source')}); alış {(prices.get('purchase') or {}).get('price_per_kg', 0):.1f} "
+        f"TL/kg canlı ({(prices.get('purchase') or {}).get('source')}).",
+        f"Baş başına: alış {ph.get('purchase', 0):,.0f}, yem {ph.get('feed', 0):,.0f} "
+        f"({r.get('feed_cost_per_day', 0):.2f} TL/gün), diğer {ph.get('other_total', 0):,.0f}, toplam maliyet "
+        f"{ph.get('total_cost', 0):,.0f}, gelir {ph.get('revenue', 0):,.0f}, KÂR {ph.get('profit', 0):,.0f} TL.",
+        f"Sürü kârı {herd.get('profit', 0):,.0f} TL, günlük kâr/baş {r.get('profit_per_day', 0):.1f} TL, "
+        f"başabaş kesim fiyatı {r.get('breakeven_carcass_price', 0):.1f} TL/kg, yemden yararlanma "
+        f"{r.get('feed_conversion', 0):.2f}.",
+    ]
+    lines += [f"Uyarı: {w}" for w in r.get("warnings") or []]
+    lines += [f"Öneri ({a['kind']}): {a['text']}" for a in r.get("advice") or []]
+    return "\n".join(lines)
+
+
+SUMMARIZERS = {"ration": summarize_ration, "compound": summarize_compound, "economics": summarize_economics}
+
+
+# ============================================================
+# Araçlar — her biri (modele verilecek metin, ekranda gösterilecek yapı | None) döndürür
+# ============================================================
+
+def _all_feed_names() -> List[str]:
     with SessionLocal() as db:
-        feeds = db.query(Feed).order_by(Feed.feed_type, Feed.name).all()
+        return [name for (name,) in db.query(Feed.name).all()]
+
+
+def search_knowledge_base(query: str, _sources: Optional[List[str]] = None) -> ToolResult:
+    hits = query_with_sources(query, n_results=4)
+    if not hits:
+        return "Bilgi tabanında ilgili bilgi bulunamadı.", None
+    if _sources is not None:
+        _sources.extend(src for _, src in hits if src not in _sources)
+    return "\n\n".join(f"[Kaynak: {src}]\n{text}" for text, src in hits), None
+
+
+def get_feed_data(feed_names: Any = None) -> ToolResult:
+    wanted = _as_list(feed_names)
+    with SessionLocal() as db:
+        feeds = db.query(Feed).order_by(Feed.display_order).all()
+    if wanted:
+        names = set(_match_feed_names(wanted, [f.name for f in feeds]))
+        feeds = [f for f in feeds if f.name in names]
     if not feeds:
-        return "Veritabanında yem verisi yok.", None
-    lines = ["Mevcut yemler (besin değerleri KM bazında):"] + [
-        f"- {f.name} [{f.feed_type}]: {f.price_per_kg} TL/kg, KM %{f.dry_matter}, "
-        f"HP %{f.crude_protein}, ME {f.metabolic_energy * 1000:.0f} kcal/kg, "
-        f"nişasta %{f.starch or 0:.0f}, yağ %{f.ether_extract or 0:.1f}, NDF %{f.ndf}, "
-        f"Ca {f.calcium} g/kg, P {f.phosphorus} g/kg"
+        return "Bu adla yem bulunamadı.", None
+    lines = ["Yem değerleri (HP ve ME doğal halde, Ca/P/NDF KM'de):"] + [
+        f"- {f.name} [{f.feed_type}]: {f.price_per_kg:.2f} TL/kg ({f.price_source}), KM %{f.dry_matter:g}, "
+        f"HP %{f.crude_protein * f.dry_matter / 100:.1f}, ME {f.metabolic_energy * f.dry_matter * 10:.0f} kcal/kg, "
+        f"NDF %{f.ndf:g}, Ca {f.calcium:g} g/kg, P {f.phosphorus:g} g/kg"
         for f in feeds
     ]
     return "\n".join(lines), None
 
 
 def calculate_ration(
-    feed_names: str = "",
-    constraints: Any = None,
+    feed_names: Any = None,
+    group: str = "lactating",
     animal_weight: float = 650.0,
     milk_yield: float = 30.0,
-    group: str = "lactating",
+    daily_gain: Optional[float] = None,
+    days_on_feed: int = 60,
     days_in_milk: int = 120,
     fat_pct: float = 3.8,
     days_pregnant: int = 0,
     first_lactation: bool = False,
-    force_use_all_feeds: bool = True,
-    min_inclusion_pct_dm: float = 3.0,
-    daily_gain: Optional[float] = None,
-    days_on_feed: int = 60,
+    constraints: Any = None,
+    cheapest_subset: bool = False,
 ) -> ToolResult:
-    """Run the same two-phase optimizer the /optimize endpoint uses.
+    """Ekrandaki "Rasyonu hesapla" ile aynı: main.optimize (öneriler dahil)."""
+    from .main import optimize          # döngüsel import: main bu modülü içe aktarıyor
+    from .schemas import AnimalProfileIn, OptimizationRequest
 
-    Targets come from the ME + CP requirements of the described animal; `constraints`
-    only overrides the keys the user stated explicitly. With no (matching) feed names,
-    every feed is a candidate and none is forced in.
-    """
     group = group if group in RULES_BY_GROUP else "lactating"
     if daily_gain is None:
         daily_gain = 0.3 if group == "lamb" else 1.4
-    profile = AnimalProfile(
-        group=group,
-        body_weight_kg=float(animal_weight),
-        milk_kg=float(milk_yield or 0.0),
-        fat_pct=float(fat_pct),
-        days_in_milk=max(1, int(days_in_milk)),
-        multiparous=not bool(first_lactation),
-        days_pregnant=max(0, int(days_pregnant)),
-        daily_gain_kg=min(max(float(daily_gain), 0.0), 2.5),
-        days_on_feed=max(1, int(days_on_feed)),
-    )
-    req = compute_requirements(profile)
-    explicit = parse_constraints(constraints)
-    target = requirements_to_constraints(req)
-    for name, value in vars(explicit).items():
-        if value is not None:
-            setattr(target, name, value)
-    requested = [n.strip() for n in str(feed_names).split(",") if n.strip()]
-
+    all_names = _all_feed_names()
+    names = _match_feed_names(_as_list(feed_names), all_names)
+    use_all = bool(names) and not cheapest_subset
+    if not names:
+        names = all_names               # yem söylenmediyse hepsi aday, hiçbiri zorunlu değil
     with SessionLocal() as db:
-        all_feeds = db.query(Feed).all()
-        names = _match_feed_names(requested, [f.name for f in all_feeds])
-        if names:
-            selected = [f for f in all_feeds if f.name in names]
-            if not any(f.feed_type in ("mineral", "salt") for f in selected):
-                defaults = DEFAULT_LAMB_MINERALS if group == "lamb" else DEFAULT_MINERALS
-                selected += [f for f in all_feeds if f.name in defaults]
-        else:
-            logger.info("Yem eşleşmesi yok (%s), tüm yemler aday", requested)
-            selected, force_use_all_feeds = all_feeds, False
-        feed_inputs = feeds_from_db(selected)
-
-    rules = rules_for(profile)
-    result = optimize_ration(
-        feed_inputs,
-        target,
-        use_all_selected=bool(force_use_all_feeds),
-        min_inclusion_pct_dm=float(min_inclusion_pct_dm),
-        expected_daily_intake_kg=target.daily_intake_kg,
-        max_daily_intake_kg=(profile.body_weight_kg * 0.05) / 0.35,
-        body_weight_kg=profile.body_weight_kg,
-        rules=rules,
-    )
-    result.adjustments = [
-        f"{'🐑' if group == 'lamb' else '🐄'} {rules.label}, {profile.body_weight_kg:.0f} kg"
-        + (f", {profile.milk_kg:.0f} kg süt, laktasyonun {profile.days_in_milk}. günü"
-           if group == "lactating" else "")
-        + (f", hedef {profile.daily_gain_kg:g} kg/gün artış, besinin {profile.days_on_feed}. günü"
-           if group in GROWTH_GROUPS else "")
-        + f": KMT {req.dm_intake_kg} kg, ME {req.me_mcal_day * 1000:,.0f} kcal/gün "
-          f"({req.me_min * 1000:.0f} kcal/kg KM), HP {req.cp_g_day:.0f} g/gün (%{req.cp_min} KM)."
-    ] + [f"ℹ️ {note}" for note in req.notes] + result.adjustments
-    if group in GROWTH_GROUPS:
-        annotate_growth_result(result, profile)
-    structured = optimization_result_to_schema(result, feed_inputs).model_dump()
-    return format_result_for_agent(result), structured
+        types = {f.name: f.feed_type for f in db.query(Feed).all()}
+        if not any(types.get(n) in ("mineral", "salt") for n in names):
+            names += [n for n in (DEFAULT_LAMB_MINERALS if group == "lamb" else DEFAULT_MINERALS)
+                      if n in types and n not in names]
+        explicit = parse_constraints(constraints)
+        # Yalnız kullanıcının açıkça söylediği hedefler profilden gelenlerin üstüne yazılır.
+        overrides = {k: v for k, v in vars(explicit).items()
+                     if v is not None and k != "daily_intake_kg" and not k.startswith("net_energy")}
+        if explicit.daily_intake_kg:
+            overrides["target_dm_intake_kg"] = explicit.daily_intake_kg
+        request = OptimizationRequest(
+            animal=AnimalProfileIn(
+                group=group, body_weight_kg=float(animal_weight),
+                milk_kg=float(milk_yield or 0) if group == "lactating" else 0.0,
+                fat_pct=float(fat_pct), days_in_milk=max(1, int(days_in_milk)),
+                multiparous=not bool(first_lactation), days_pregnant=max(0, int(days_pregnant)),
+                daily_gain_kg=min(max(float(daily_gain), 0.0), 2.5), days_on_feed=max(1, int(days_on_feed)),
+            ),
+            selected_feed_names=names, use_all_selected_feeds=use_all, with_advice=True, **overrides,
+        )
+        result = optimize(request, db).model_dump()
+    result["request"] = {"animal": request.animal.model_dump(), "selected_feed_names": names}
+    return summarize_ration(result), {"kind": "ration", "data": result}
 
 
+def design_compound_feed(type_key: str = "sut_21", feed_names: Any = None, batch_kg: float = 1000.0,
+                         cp_target: Optional[float] = None) -> ToolResult:
+    """Ekrandaki "Karma yemi hesapla" ile aynı: main.compound_feed (öneriler dahil)."""
+    from .compound_feed import COMPOUND_FEED_TYPES
+    from .main import compound_feed
+    from .schemas import CompoundFeedRequest
+
+    if type_key not in COMPOUND_FEED_TYPES:
+        return f"Bilinmeyen karma yem tipi '{type_key}'. Geçerli tipler: {', '.join(COMPOUND_FEED_TYPES)}", None
+    all_names = _all_feed_names()
+    names = _match_feed_names(_as_list(feed_names), all_names)
+    if not names:
+        return ("Karma yem için hammadde adı gerekli (ör. arpa, mısır, ayçiçeği küspesi, kepek). "
+                "Kullanıcıya elindeki hammaddeleri sor."), None
+    names += [n for n in DEFAULT_COMPOUND_MINERALS if n in all_names and n not in names]
+    request = CompoundFeedRequest(type_key=type_key, selected_feed_names=names, batch_kg=float(batch_kg),
+                                  cp_min=_to_float(cp_target), with_advice=True)
+    with SessionLocal() as db:
+        result = compound_feed(request, db).model_dump()
+    result["request"] = {"type_key": type_key, "selected_feed_names": names, "batch_kg": float(batch_kg)}
+    return summarize_compound(result), {"kind": "compound", "data": result}
+
+
+def fattening_economics(species: str = "beef", head_count: int = 1, start_weight_kg: float = 300.0,
+                        daily_gain_kg: Optional[float] = None, days: int = 180, feed_names: Any = None,
+                        region: Optional[str] = None, dressing_pct: Optional[float] = None) -> ToolResult:
+    """Ekrandaki "Besi ekonomisini hesapla" ile aynı: main.fattening_economics."""
+    from fastapi import HTTPException
+
+    from .main import fattening_economics as economics_endpoint
+    from .schemas import EconomicsRequest
+
+    species = "lamb" if species in ("lamb", "kuzu", "sheep", "küçükbaş") else "beef"
+    if daily_gain_kg is None:
+        daily_gain_kg = 0.3 if species == "lamb" else 1.4
+    all_names = _all_feed_names()
+    names = _match_feed_names(_as_list(feed_names), all_names)
+    if not names:
+        names = (["Yonca Kuru Otu", "Buğday Samanı", "Arpa", "Mısır", "Ayçiçeği Küspesi 36", "Buğday Kepeği"]
+                 if species == "lamb" else
+                 ["Mısır Silajı", "Buğday Samanı", "Arpa", "Mısır", "Ayçiçeği Küspesi 36", "Buğday Kepeği"])
+    defaults = DEFAULT_LAMB_MINERALS if species == "lamb" else DEFAULT_MINERALS
+    names += [n for n in defaults if n in all_names and n not in names]
+    request = EconomicsRequest(
+        species=species, head_count=max(1, int(head_count)), start_weight_kg=float(start_weight_kg),
+        daily_gain_kg=float(daily_gain_kg), days=int(days), selected_feed_names=names,
+        region=region or None, dressing_pct=_to_float(dressing_pct), with_advice=True)
+    with SessionLocal() as db:
+        try:
+            result = economics_endpoint(request, db).model_dump(mode="json")
+        except HTTPException as exc:
+            return f"Hesaplanamadı: {exc.detail}", None
+    result["request"] = request.model_dump(mode="json")
+    return summarize_economics(result), {"kind": "economics", "data": result}
+
+
+_FEED_ARRAY = {"type": "array", "items": {"type": "string"},
+               "description": "Kullanıcının söylediği yemler, Türkçe adlarıyla (ör. 'mısır silajı', 'arpa', 'soya')."}
+TOOL_SPECS = [
+    {"type": "function", "function": {
+        "name": "search_knowledge_base",
+        "description": "Rasyon notları, program kuralları ve yem tablolarında arama yapar. Beslemeyle ilgili "
+                       "bilgi/'neden' sorularında önce bunu kullan.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_feed_data",
+        "description": "Yemlerin fiyatı, HP, ME, NDF, Ca, P değerleri. Ad verilmezse tüm yemler.",
+        "parameters": {"type": "object", "properties": {"feed_names": _FEED_ARRAY}}}},
+    {"type": "function", "function": {
+        "name": "calculate_ration",
+        "description": "Bir hayvan için ihtiyacı karşılayan en ucuz günlük rasyonu hesaplar (öneriler dahil). "
+                       "Rasyon istenince MUTLAKA bunu çağır.",
+        "parameters": {"type": "object", "properties": {
+            "group": {"type": "string", "enum": ["lactating", "dry_faroff", "dry_closeup", "beef", "lamb"],
+                      "description": "lactating=sağmal, dry_faroff=kuru (erken), dry_closeup=doğuma son 3 hafta, "
+                                     "beef=besi sığırı, lamb=küçükbaş/kuzu/toklu besisi"},
+            "animal_weight": {"type": "number", "description": "Canlı ağırlık, kg"},
+            "milk_yield": {"type": "number", "description": "Sağmalda günlük süt, kg (1 litre ≈ 1 kg)"},
+            "daily_gain": {"type": "number", "description": "Besi/küçükbaşta hedef günlük artış, kg (300 g = 0.3)"},
+            "days_on_feed": {"type": "integer", "description": "Besinin kaçıncı günü (besi başında kaba yem fazla)"},
+            "days_pregnant": {"type": "integer"}, "fat_pct": {"type": "number"},
+            "feed_names": _FEED_ARRAY,
+            "cheapest_subset": {"type": "boolean", "description": "true: seçilenlerin hepsini kullanmak zorunda değil"}},
+            "required": ["group", "animal_weight"]}}},
+    {"type": "function", "function": {
+        "name": "design_compound_feed",
+        "description": "Karma yem (konsantre) için en ucuz karışımı hesaplar.",
+        "parameters": {"type": "object", "properties": {
+            "type_key": {"type": "string", "enum": ["sut_23", "sut_22", "sut_21", "buzagi_19", "buzagi_baslangic",
+                                                    "buzagi_buyutme", "duve_16", "duve_15", "duve_14", "besi_13", "besi_12"],
+                         "description": "sut_21 = %21 HP süt yemi, besi_13 = %13 besi yemi, buzagi_* buzağı yemleri"},
+            "feed_names": _FEED_ARRAY, "batch_kg": {"type": "number", "description": "Karışım miktarı, kg (varsayılan 1000)"}},
+            "required": ["type_key", "feed_names"]}}},
+    {"type": "function", "function": {
+        "name": "fattening_economics",
+        "description": "Bir besi döneminin maliyet, gelir ve kârını hesaplar (kesim fiyatı UKON'dan).",
+        "parameters": {"type": "object", "properties": {
+            "species": {"type": "string", "enum": ["beef", "lamb"]},
+            "head_count": {"type": "integer"}, "start_weight_kg": {"type": "number"},
+            "daily_gain_kg": {"type": "number"}, "days": {"type": "integer"}, "feed_names": _FEED_ARRAY,
+            "region": {"type": "string", "description": "UKON bölgesi, ör. 'Marmara Bölgesi' (boş = Türkiye ortalaması)"},
+            "dressing_pct": {"type": "number", "description": "Karkas randımanı %"}},
+            "required": ["species", "head_count", "start_weight_kg", "days"]}}},
+]
 TOOLS = {
     "search_knowledge_base": search_knowledge_base,
     "get_feed_data": get_feed_data,
     "calculate_ration": calculate_ration,
+    "design_compound_feed": design_compound_feed,
+    "fattening_economics": fattening_economics,
 }
 
 
 # ============================================================
-# LLM (Groq) — lazily constructed on first use.
-#
-# ChatGroq raises at construction time when GROQ_API_KEY is unset. Building it at
-# import time therefore took the WHOLE backend down with it — including the
-# deterministic /optimize path, which never touches an LLM. Everything except
-# /api/v1/agent/query must keep working without a key.
+# LLM sağlayıcısı — OpenAI uyumlu /chat/completions (NVIDIA NIM, Groq)
 # ============================================================
 
-# Groq retires models without much notice (llama-3.3-70b-versatile started answering
-# 404 model_not_found), so the model is overridable without a code change.
-GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b"
+# (temel adres, anahtar değişkeni, varsayılan model)
+PROVIDERS = {
+    "nvidia": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "openai/gpt-oss-120b"),
+}
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT", "120"))
+MAX_TOOL_ROUNDS = 4
+HISTORY_TURNS = 8
 
-_llm: Optional[ChatGroq] = None
+
+def _provider() -> Optional[Tuple[str, str, str, str]]:
+    """(ad, temel adres, anahtar, model) — LLM_PROVIDER ya da anahtarı olan ilk sağlayıcı."""
+    wanted = os.getenv("LLM_PROVIDER", "").strip().lower()
+    order = [wanted] if wanted in PROVIDERS else list(PROVIDERS)
+    for name in order:
+        base, key_var, default_model = PROVIDERS[name]
+        key = os.getenv(key_var, "").strip()
+        if key:
+            # GROQ_MODEL eski ayar adı, geriye uyumluluk için okunur.
+            model = (os.getenv("LLM_MODEL", "").strip()
+                     or (os.getenv("GROQ_MODEL", "").strip() if name == "groq" else "") or default_model)
+            return name, base, key, model
+    return None
 
 
 def llm_available() -> bool:
-    """True when a Groq API key is configured (no network call, no client built)."""
-    return bool(os.getenv("GROQ_API_KEY", "").strip())
+    """Bir sağlayıcının anahtarı tanımlı mı (ağ çağrısı yok)."""
+    return _provider() is not None
 
 
-def _get_llm() -> ChatGroq:
-    """Return the shared ChatGroq client, building it on first use."""
-    global _llm
-    if _llm is None:
-        if not llm_available():
-            raise RuntimeError(
-                "GROQ_API_KEY tanımlı değil. Sohbet uç noktası devre dışı; "
-                "rasyon hesaplama (/api/v1/optimize) anahtarsız da çalışır."
-            )
-        # api_key is read from the GROQ_API_KEY environment variable automatically.
-        _llm = ChatGroq(temperature=0, model_name=GROQ_MODEL)
-    return _llm
+def llm_info() -> Optional[str]:
+    provider = _provider()
+    return f"{provider[0]} · {provider[3]}" if provider else None
 
 
-SYSTEM_PROMPT = """You are RationAI, a dairy-cow nutrition assistant. Answer in the user's language.
-You can call one of these tools:
+def _chat(messages: List[Dict[str, Any]], tools: bool = True) -> Dict[str, Any]:
+    provider = _provider()
+    if provider is None:
+        raise RuntimeError("Sohbet için LLM anahtarı tanımlı değil (NVIDIA_API_KEY ya da GROQ_API_KEY).")
+    _, base, key, model = provider
+    body: Dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 4000}
+    if tools:
+        body["tools"] = TOOL_SPECS
+        body["tool_choice"] = "auto"
+    for attempt in range(2):
+        resp = requests.post(f"{base}/chat/completions", json=body, timeout=LLM_TIMEOUT_S,
+                             headers={"Authorization": f"Bearer {key}"})
+        if resp.status_code == 429 and attempt == 0:
+            time.sleep(5)               # ücretsiz katmanlarda dakikalık sınır
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]
+    resp.raise_for_status()
+    return {}
 
-1. search_knowledge_base
-   - args: query (string)
-   - Searches the nutrition reference documents.
 
-2. get_feed_data
-   - args: none
-   - Lists every feed with price and nutrient values.
+_THINK = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 
-3. calculate_ration
-   - Nutrition-first optimizer: it meets the nutrient targets first and minimises cost
-     only among rations that satisfy them.
-   - args:
-     - feed_names (string): comma-separated feed names, exactly as in the list below.
-       List EVERY feed the user mentioned — never leave one out to make it cheaper; the
-       solver decides the amounts. Leave empty to let it choose from all feeds.
-       Minerals are added automatically when none is listed.
-       Map the user's words literally — never swap a feed for a "similar" one:
-       plain "yonca" (alfalfa) = "Yonca Kuru Otu"; use a silage name ONLY when the user
-       says "silaj"/"silage" (plain "silaj" = "Mısır Silajı"); "soya" = "Soya Küspesi 46";
-       "ayçiçeği"/"ATK" = "Ayçiçeği Küspesi 36" unless the user names the 24 grade;
-       "saman" = "Buğday Samanı"; "kepek" = "Buğday Kepeği".
-     - Describe the ANIMAL; the tool computes the nutrient targets itself (ME + crude protein).
-       Do NOT invent nutrient targets.
-       - animal_weight (number, kg, default 650)
-       - milk_yield (number, kg milk/day, default 30; a "litre" is ~1 kg)
-       - group: "lactating" (default), "dry_faroff" (dry, >3 weeks before calving),
-         "dry_closeup" (last ~3 weeks before calving), "beef" (fattening cattle / besi) or
-         "lamb" (lamb / toklu fattening / kuzu besisi — pass the lamb's weight, e.g. 30)
-       - for "beef" and "lamb": daily_gain (kg/day, default 1.4 beef / 0.3 lamb),
-         days_on_feed (int, default 60)
-       - days_in_milk (int, default 120), fat_pct (default 3.8),
-         days_pregnant (int, 0 = not pregnant), first_lactation (bool, default false)
-     - constraints (JSON object) — ONLY targets the user stated explicitly; they override
-       the computed ones. DM basis, every key optional:
-         "crude_protein": {{"min": 16, "max": 18}}          % DM
-         "metabolizable_energy": {{"min": 2.6, "max": 2.9}} Mcal ME/kg DM (2600 kcal = 2.6)
-         "calcium": {{"min": 6, "max": 10}}                  g/kg DM = % x 10
-         "phosphorus": {{"min": 3.5, "max": 5}}              g/kg DM = % x 10
-         "daily_intake_kg": 22                             kg DM/day
-       Do NOT send "dry_matter" unless the user explicitly asks: a silage ration sits
-       near 35 % DM and a wrong range makes every target unreachable.
-     - force_use_all_feeds (bool, default true) — false only if the user wants the
-       cheapest subset.
 
-Feeds in the database (Turkish names, grouped by type):
-{feed_list}
+def _clean(text: Optional[str]) -> str:
+    """Akıl yürütme bloklarını at (bazı modeller cevaba <think> koyuyor)."""
+    return _THINK.sub("", text or "").strip()
 
-NEVER write feed amounts (kg) or a ration yourself — every ration must come from
-calculate_ration, which is always available. If the user asks for a ration, call it.
 
-Respond with ONLY a JSON object, no other text:
-- To call a tool: {{"tool": "<tool name>", "args": {{...}}}}
-- To answer directly: {{"answer": "<your answer>"}}
+SYSTEM_PROMPT = """Sen RationAI'sın: Türkiye'deki çiftçilere ve zooteknistlere hayvan beslemede yardım eden bir asistan.
+
+Kurallar:
+- Her zaman Türkçe, sade ve kısa cevap ver; çiftçinin anlayacağı dille konuş.
+- Rasyon, karma yem ya da besi kâr/zarar hesabı istenirse MUTLAKA ilgili aracı çağır:
+  calculate_ration, design_compound_feed, fattening_economics. Kendi başına yem miktarı (kg),
+  maliyet ya da kâr rakamı YAZMA — bütün rakamlar araçtan gelir.
+- Araç sonucu ekranda tablo olarak ayrıca gösteriliyor: cevabında tabloyu tekrar yazma; sonucu 3-6
+  cümleyle özetle (hedefler tuttu mu, maliyet, en önemli 1-2 öneri) ve kullanıcının sorusunu cevapla.
+- Beslemeyle ilgili bilgi ve "neden" sorularında önce search_knowledge_base ile ara ve cevabını
+  bulduğun kaynağa dayandır. Kaynakta olmayan bir şeyi genel bilginle söylüyorsan cümlenin sonuna
+  "(genel bilgi, notlarda yok)" yaz.
+- Eksik bilgi varsa (hayvanın ağırlığı, süt verimi, elindeki yemler) makul varsayım yap ve bunu
+  söyle; ya da kısa bir soruyla sor.
+- Hayvan grupları: sağmal inek, kuru dönem (erken / doğuma yakın), besi sığırı, küçükbaş (kuzu/toklu) besisi.
+- Ekrandaki ya da önceki bir sonuç hakkında "neden" sorulursa (ör. "neden saman az?"), önce o sonucun
+  "Öneri (sinir)" ve uyarı satırlarına bak: çoğu zaman cevap programın bir kuralıdır (ör. sağmalda saman
+  en fazla %8, arpa en fazla %40). Kuralın gerekçesi için search_knowledge_base ile "RationAI Kuralları"
+  belgesinde ara.
+- Önceki mesajlara atıf yapılırsa ("bir de arpayı çıkarırsam?") önceki hesabın bilgilerini kullanıp aracı yeniden çağır.
 """
 
-
-def _feed_list_for_prompt() -> str:
-    with SessionLocal() as db:
-        rows = db.query(Feed.feed_type, Feed.name).order_by(Feed.feed_type, Feed.name).all()
-    groups: Dict[str, List[str]] = {}
-    for feed_type, name in rows:
-        groups.setdefault(feed_type or "unknown", []).append(name)
-    return "\n".join(f"- {ftype}: {', '.join(names)}" for ftype, names in groups.items())
-
-
-def _parse_llm_reply(text: str) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
-    """Return (tool_name, tool_args, direct_answer) from the LLM's JSON reply."""
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
-            if "tool" in data:
-                return data["tool"], data.get("args") or {}, None
-            if "answer" in data:
-                return None, {}, str(data["answer"])
-    return None, {}, text
+_RATION_REQUEST = re.compile(r"rasyon|ration|yemleme|karma yem|kâr|kar eder|kazan", re.IGNORECASE)
+_SUSPECT_ANSWER = re.compile(r"\d+(?:[.,]\d+)?\s*(?:kg|TL)\b", re.IGNORECASE)
+_TOOL_REMINDER = ("Bu bir hesap isteği. Rakamları kendin yazma: uygun aracı (calculate_ration, "
+                  "design_compound_feed ya da fattening_economics) şimdi çağır.")
+_NO_ANSWER = "Üzgünüm, bu soruya şu an cevap üretemedim. Lütfen tekrar deneyin."
+_NO_CALC = ("Bu hesabı şu an yapamadım. Lütfen tekrar deneyin ya da ekrandaki hesap düğmelerini "
+            "kullanın — onlar dil modeli olmadan çalışır.")
 
 
-# gpt-oss sometimes answers a ration request without calculate_ration: it writes feed
-# amounts itself or claims the tool is unavailable. Made-up amounts meet no constraint,
-# so they are never shown — the request is retried once, then refused. A plain answer
-# to a knowledge question ("rasyonda nişasta neden önemli?") passes untouched.
-_RATION_REQUEST = re.compile(r"rasyon|ration|yemleme", re.IGNORECASE)
-_SUSPECT_ANSWER = re.compile(
-    r"\d+(?:[.,]\d+)?\s*kg|erişilemiyor|kullanılamıyor|unavailable", re.IGNORECASE
-)
-_TOOL_REMINDER = (
-    "This is a ration request. Do not answer with amounts yourself: call calculate_ration "
-    "now. It is available."
-)
-_NO_ANSWER = "Üzgünüm, bu soruya şu an yanıt üretemedim. Lütfen tekrar deneyin."
-_NO_RATION = (
-    "Rasyonu şu an hesaplayamadım. Lütfen tekrar deneyin ya da arayüzdeki "
-    "\"Rasyonu hesapla\" butonunu kullanın — o yol dil modeli olmadan çalışır."
-)
+def run_agent(query: str, history: Optional[List[Dict[str, str]]] = None,
+              context: Optional[Dict[str, Any]] = None) -> AgentResponse:
+    """Bir sohbet turu. `context` = ekrandaki son sonuç ({"kind", "data"}); varsa modele özeti verilir.
 
-
-def _ask_llm(messages) -> Tuple[AIMessage, Optional[str], Dict[str, Any], str]:
-    """Invoke the LLM; return (raw message, tool_name, tool_args, direct_answer)."""
-    ai_msg: AIMessage = _get_llm().invoke(messages)
-    response_text = ai_msg.content.strip()
-    from_reasoning = not response_text
-    if from_reasoning:
-        # gpt-oss sometimes ends its turn inside the reasoning channel, leaving `content`
-        # empty with the JSON reply at the end of `reasoning_content`. Use that JSON — but
-        # never show raw reasoning to the user.
-        reasoning = ai_msg.additional_kwargs.get("reasoning_content", "")
-        start = max(reasoning.rfind('{"tool"'), reasoning.rfind('{"answer"'))
-        response_text = reasoning[start:] if start >= 0 else ""
-    tool_name, tool_args, direct_answer = _parse_llm_reply(response_text)
-    unparsed = direct_answer == response_text  # no JSON envelope was found
-    if tool_name is None and (not direct_answer.strip() or (from_reasoning and unparsed)):
-        direct_answer = _NO_ANSWER
-    logger.debug("LLM ham yanıtı: %s", response_text)
-    logger.debug("tool_name=%s, tool_args=%s", tool_name, tool_args)
-    return ai_msg, tool_name, tool_args, direct_answer
-
-
-def agent_node(state: AgentState):
-    """Ask the LLM to either pick a tool (with args) or answer directly."""
-    user_query = state["messages"][-1].content
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT.format(feed_list=_feed_list_for_prompt())),
-        HumanMessage(content=user_query),
-    ]
-    ai_msg, tool_name, tool_args, direct_answer = _ask_llm(messages)
-    if tool_name is None and _RATION_REQUEST.search(user_query) and _SUSPECT_ANSWER.search(direct_answer):
-        logger.info("Rasyon isteği araçsız yanıtlandı, yeniden soruluyor")
-        ai_msg, tool_name, tool_args, direct_answer = _ask_llm(
-            messages + [SystemMessage(content=_TOOL_REMINDER)]
-        )
-        if tool_name is None:
-            direct_answer = _NO_RATION
-
-    context = dict(state.get("context", {}))
-    if tool_name is not None:
-        # Keep the raw message: the tool executor appends the readable result after it.
-        context.update(tool_name=tool_name, tool_args=tool_args)
-        return {"messages": state["messages"] + [ai_msg], "context": context}
-
-    # Append the EXTRACTED answer, not the raw message: the LLM replies with a JSON
-    # envelope ({"answer": "..."}) and `run_agent` returns the last AIMessage, so
-    # appending `ai_msg` here made users see that raw JSON as the agent's answer.
-    return {"messages": state["messages"] + [AIMessage(content=direct_answer)], "context": context}
-
-
-def tool_executor_node(state: AgentState):
-    """Run the tool the LLM picked and append its readable result."""
-    context = dict(state["context"])
-    tool_name = context.pop("tool_name")
-    tool_args = context.pop("tool_args", {})
-
-    tool = TOOLS.get(tool_name)
-    if tool is None:
-        text, structured = f"Bilinmeyen araç: '{tool_name}'", None
-    else:
-        try:
-            text, structured = tool(**tool_args)
-        except Exception as exc:
-            logger.exception("Araç %s başarısız (args=%r)", tool_name, tool_args)
-            text, structured = f"Araç çalıştırılamadı ({tool_name}): {exc}", None
-
-    if structured:
-        context["optimization_result"] = structured
-    return {"messages": state["messages"] + [AIMessage(content=text)], "context": context}
-
-
-def create_agent_graph():
-    workflow = StateGraph(AgentState)
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tool_executor", tool_executor_node)
-    workflow.set_entry_point("agent")
-    workflow.add_conditional_edges(
-        "agent",
-        lambda state: "tool_executor" if "tool_name" in state.get("context", {}) else END,
-        {"tool_executor": "tool_executor", END: END},
-    )
-    workflow.add_edge("tool_executor", END)
-    return workflow.compile()
-
-
-agent_graph = create_agent_graph()
-
-
-def run_agent(query: str) -> AgentResponse:
-    """Run the agent on a user query.
-
-    Raises whatever the graph raised, after logging it — the endpoint turns it into
-    HTTP 500 instead of folding a crash into a 200 response.
+    Hata olursa loglanıp yeniden fırlatılır — uç nokta 500'e çevirir (çökme 200 olarak dönmez).
     """
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if context and context.get("kind") in SUMMARIZERS:
+        messages.append({"role": "system", "content": "Kullanıcının ekranda baktığı son sonuç:\n"
+                         + SUMMARIZERS[context["kind"]](context.get("data") or {})
+                         + ("\nBu sonucun girdileri: " + json.dumps(context["data"].get("request"), ensure_ascii=False)
+                            if (context.get("data") or {}).get("request") else "")})
+    for turn in (history or [])[-HISTORY_TURNS:]:
+        if turn.get("role") in ("user", "assistant") and turn.get("content"):
+            messages.append({"role": turn["role"], "content": str(turn["content"])})
+    messages.append({"role": "user", "content": query})
+
+    sources: List[str] = []
+    tools_used: List[str] = []
+    structured: Optional[Dict[str, Any]] = None
+    reminded = False
     try:
-        final_state = agent_graph.invoke({"messages": [HumanMessage(content=query)], "context": {}})
+        for _ in range(MAX_TOOL_ROUNDS + 1):
+            msg = _chat(messages)
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                answer = _clean(msg.get("content"))
+                if (not tools_used and not reminded and _RATION_REQUEST.search(query)
+                        and _SUSPECT_ANSWER.search(answer)):
+                    # Model hesabı araçsız, kafadan yaptı: bir kez uyar, yine olmazsa gösterme.
+                    logger.info("Hesap isteği araçsız cevaplandı, yeniden soruluyor")
+                    reminded = True
+                    messages += [{"role": "assistant", "content": answer},
+                                 {"role": "system", "content": _TOOL_REMINDER}]
+                    continue
+                if reminded and not tools_used:
+                    answer = _NO_CALC
+                break
+            messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+            for call in calls:
+                name = call["function"]["name"]
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                tool = TOOLS.get(name)
+                if tool is None:
+                    text, data = f"Bilinmeyen araç: {name}", None
+                else:
+                    try:
+                        if name == "search_knowledge_base":
+                            text, data = tool(_sources=sources, **args)
+                        else:
+                            text, data = tool(**args)
+                    except Exception as exc:   # noqa: BLE001 - modele hata metni verilir
+                        logger.exception("Araç %s başarısız (args=%r)", name, args)
+                        text, data = f"Araç çalıştırılamadı ({name}): {exc}", None
+                tools_used.append(name)
+                if data:
+                    structured = data
+                messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": text})
+        else:
+            # Tur sınırı doldu: araçsız son bir cevap iste.
+            answer = _clean(_chat(messages + [{"role": "system", "content": "Şimdi kısa bir cevap yaz."}],
+                                  tools=False).get("content"))
     except Exception:
         logger.exception("run_agent başarısız (query=%r)", query)
         raise
 
-    text = next(
-        (msg.content for msg in reversed(final_state["messages"]) if isinstance(msg, AIMessage)),
-        "Üzgünüm, isteğinizi işleyemedim.",
-    )
+    answer = answer or _NO_ANSWER
     return AgentResponse(
-        success=True,
-        answer=text,
-        response=text,
-        optimization_result=final_state.get("context", {}).get("optimization_result"),
+        success=True, answer=answer, response=answer, sources=sources, tools_used=tools_used,
+        result=structured, model=llm_info(),
+        optimization_result=structured["data"] if structured and structured["kind"] == "ration" else None,
     )

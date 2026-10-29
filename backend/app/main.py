@@ -375,20 +375,21 @@ def compound_feed(request: CompoundFeedRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/v1/agent/query", response_model=AgentResponse)
 def agent_query(query: AgentQuery):
-    """Free-text questions through the LLM agent.
+    """Free-text chat through the LLM agent (history + the result on screen as context).
 
-    Without a GROQ_API_KEY this is the only endpoint that stops working: it answers
-    503 while the rest of the API stays up. A crash inside the agent is reported as
-    HTTP 500 — not folded into a 200 — so callers can tell "answered" from "crashed".
+    Without an LLM key (NVIDIA_API_KEY or GROQ_API_KEY) this is the only endpoint that
+    stops working: it answers 503 while the rest of the API stays up. A crash inside the
+    agent is reported as HTTP 500 — not folded into a 200 — so callers can tell
+    "answered" from "crashed".
     """
     if not llm_available():
         raise HTTPException(
             status_code=503,
-            detail="GROQ_API_KEY tanımlı değil, sohbet uç noktası devre dışı. "
+            detail="Sohbet için LLM anahtarı tanımlı değil (NVIDIA_API_KEY ya da GROQ_API_KEY). "
                    "Rasyon hesaplama (/api/v1/optimize) anahtarsız da çalışır.",
         )
     try:
-        return run_agent(query.query)
+        return run_agent(query.query, [t.model_dump() for t in query.history], query.context)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ajan sorguyu yanıtlayamadı: {exc}")
 

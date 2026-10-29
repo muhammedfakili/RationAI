@@ -93,7 +93,7 @@ besinin kaçıncı gününde olduğunuz yeterli. RationAI:
 
 ## Kuzu / toklu besisi
 
-Hayvan grubunda **"Kuzu besisi"**ni seçin: canlı ağırlık, hedef günlük artış (gram) ve besi günü.
+Hayvan grubunda **"Küçükbaş besisi"**ni seçin: canlı ağırlık, hedef günlük artış (gram) ve besi günü.
 
 - Kuru madde, protein, kalsiyum ve fosfor ihtiyacını koyun standardından (NRC) ağırlığa göre
   alır: 20 kg kuzu canlı ağırlığının ~%5'ini, 50 kg toklu ~%3'ünü yer.
@@ -105,7 +105,7 @@ Hayvan grubunda **"Kuzu besisi"**ni seçin: canlı ağırlık, hedef günlük ar
 
 ## Besi ekonomisi: bu besi kâr eder mi?
 
-Sol menüden **"Besi ekonomisi"**ni seçin: tür (besi sığırı / kuzu), hayvan sayısı, besi başı
+Üst menüden **"Besi ekonomisi"**ni seçin: tür (besi sığırı / küçükbaş), hayvan sayısı, besi başı
 ağırlığı, günlük artış ve besi süresi. Elinizdeki yemleri işaretleyin.
 
 - Yem maliyeti **besi ortasındaki ağırlığın** rasyonundan hesaplanır (en ucuz, ihtiyacı tam
@@ -140,9 +140,28 @@ yemi seçime ekler ve rasyonu yeniden hesaplar. Karma yemde ve besi ekonomisinde
 besi ekonomisinde ayrıca başabaş kesim fiyatını, maliyet dağılımını ve daha kârlı bir besi
 süresini söyler.
 
+## Asistan: sor, hesaplasın
+
+Her sayfanın sağ üstündeki **"Asistan"** düğmesi bir sohbet penceresi açar; RationAI'a yazarak
+sorabilirsiniz:
+
+- *"650 kilo, günde 30 litre süt veren ineğim var; elimde silaj, saman, arpa ve soya var. Rasyon hazırla."*
+  — hesabı ekrandaki çözücüyle yapar, tabloyu ve önerileri sohbetin içinde gösterir.
+- *"Peki soyayı çıkarıp ayçiçeği koysam?"* — önceki hesabı hatırlar, yeniden hesaplar.
+- *"Kuru dönemdeki ineğe neden yonca verilmez?"* — rasyon notlarına ve programın kurallarına
+  dayanarak cevaplar, kaynağını yazar.
+- Karma yem (*"1 ton %21 süt yemi yap"*) ve besi kârı (*"114 danayı 270 gün beslesem ne
+  kazanırım?"*) da sorulabilir.
+
+Her sonucun altındaki **"Bu sonuç hakkında sor"** kutusuyla ekrandaki hesap hakkında soru
+sorabilir, sohbetteki bir sonucu **"ekranında aç"** ile ilgili sayfaya taşıyabilirsiniz.
+Rakamlar her zaman çözücüden gelir; yapay zekâ yalnızca anlatır. Sohbet için `.env`'ye ücretsiz
+bir NVIDIA (build.nvidia.com) ya da Groq anahtarı eklemek yeterli; anahtar olmadan da hesap
+ekranlarının hepsi çalışır.
+
 ## Karma yem de hazırlar
 
-Sol menüden **"Karma yem"**i seçin: yem tipini (süt yemi %21–23, buzağı başlangıç / büyütme,
+Üst menüden **"Karma yem"**i seçin: yem tipini (süt yemi %21–23, buzağı başlangıç / büyütme,
 düve–kuru dönem–besi başlangıç %14–16, besi yemi %12–13 ya da kendi hedefiniz) ve elinizdeki
 hammaddeleri işaretleyin. RationAI 1 ton (veya istediğiniz miktar) için hedef ham protein ve
 enerjiyi tutturan **en ucuz karışımı** defterdeki gibi çıkarır: her hammaddenin kilosu, HP ve
@@ -182,8 +201,8 @@ motoruyla yapar — miktarları kafasından yazmaz.
 ## Ücretsiz mi?
 
 Evet. Rasyon hesaplama tamamen ücretsizdir ve internet bağlantısı olmadan da çalışır. Sadece sohbet
-özelliği için ücretsiz bir [Groq](https://console.groq.com) anahtarı gerekir; anahtar yoksa sohbet
-kapanır, geri kalan her şey çalışır.
+özelliği için ücretsiz bir [NVIDIA](https://build.nvidia.com) ya da [Groq](https://console.groq.com)
+anahtarı gerekir; anahtar yoksa sohbet kapanır, geri kalan her şey çalışır.
 
 > ⚠️ **Not:** RationAI bir karar destek aracıdır. Yem besin değerleri tablolardaki tipik
 > değerlerdir; yeminizin laboratuvar analizi varsa sonuç daha isabetli olur. Hasta, çok yüksek

@@ -283,8 +283,16 @@ class CompoundFeedResponse(BaseModel):
     advice: List[Advice] = Field(default_factory=list)
 
 
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class AgentQuery(BaseModel):
     query: str
+    history: List[ChatTurn] = Field(default_factory=list, description="Earlier turns, oldest first")
+    context: Optional[Dict[str, Any]] = Field(
+        None, description='Result on screen: {"kind": "ration"|"compound"|"economics", "data": {...}}')
 
 
 class AgentResponse(BaseModel):
@@ -293,6 +301,11 @@ class AgentResponse(BaseModel):
     answer: Optional[str] = None
     response: Optional[str] = None
     optimization_result: Optional[Dict[str, Any]] = None
+    result: Optional[Dict[str, Any]] = Field(
+        None, description='Structured result of the last calculation tool: {"kind", "data"}')
+    sources: List[str] = Field(default_factory=list, description="Knowledge-base files the answer drew on")
+    tools_used: List[str] = Field(default_factory=list)
+    model: Optional[str] = None
 
 
 class HealthCheckResponse(BaseModel):
