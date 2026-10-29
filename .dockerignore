@@ -8,8 +8,10 @@ __pycache__/
 # Yerel veri: konteyner Postgres ve imaja gömülü ChromaDB indeksi kullanır.
 rationai.db
 data/chroma_db/
-# Defter notları (fotoğraflar + döküm) çalışma zamanında okunmaz.
-data/notlar/
+# Defter fotoğrafları imaja girmez; döküm (rasyon_notlari.md) bilgi tabanına ingest edilir.
+data/notlar/*.jpeg
+data/notlar/*.jpg
+data/notlar/*.png
 
 # Sırlar ve yerel ayarlar — .env ASLA imaja girmez, değerler compose'tan gelir.
 .env

@@ -177,18 +177,20 @@ _CURATED_FEEDS = [
     # ad, tip, TL/kg, KM %, HP % (doğal), ME kcal/kg (doğal), NDF, Ca, P, max kg, nişasta, EE, RUP
     # ---- KABA YEM -----------------------------------------------------------
     # Silaj sağlık sınırı 25 kg/gün: fazlası asidoz ve ishal yapar. Yonca kuru otu 8 kg.
-    ("Mısır Silajı",             "silage",    5.0, 30.0,   3.5,  900, 45.0,   3.0,   2.0, 25.0,  32.0,   3.2,   27),
+    # Silaj fiyatları yıl ortalaması (Ekim 2026): mısır 4.0 = Bursa DSYB bülteni (hasatta 2.6, baharda 5–5.5).
+    # Diğer silajlar enerjisine göre mısıra oranlandı (yonca ~4.5 paketli ilan); kullanıcı fiyatı geçerli.
+    ("Mısır Silajı",             "silage",    4.0, 30.0,   3.5,  900, 45.0,   3.0,   2.0, 25.0,  32.0,   3.2,   27),
     ("Yonca Kuru Otu",           "hay",      18.0, 88.0,  16.0, 2200, 40.0,  12.0,   3.0,  8.0,   2.0,   2.5,   22),
     ("Buğday Samanı",            "straw",     5.5, 90.0,   3.5, 1400, 78.0,   3.0,   0.8,  4.0,   1.0,   1.5,   35),
     ("Arpa Samanı",              "straw",     5.5, 90.0,   4.5, 1550, 74.0,   3.5,   1.0,  4.0,   1.0,   1.8,   35),
     ("Fiğ Kuru Otu",             "hay",      16.0, 88.0,  14.5, 2000, 45.0,  11.0,   2.5, None,   3.0,   2.5,   25),
     ("Çayır Kuru Otu",           "hay",      12.0, 85.0,   8.5, 1675, 55.0,   6.0,   2.5, None,   2.0,   2.5,   25),
     ("Korunga Kuru Otu",         "hay",      15.0, 88.0,  13.5, 1800, 46.0,  12.0,   2.4, None,   3.0,   2.5,   35),
-    ("Yonca Silajı",             "silage",    6.0, 35.0,   6.3,  788, 45.0,  13.0,   3.0, 25.0,   2.0,   3.0,   20),  # NRC
-    ("Arpa Hasılı Silajı",       "silage",    4.5, 30.0,   3.0,  660, 55.0,   4.0,   2.5, 25.0,  15.0,   3.0,   22),  # NRC
-    ("İtalyan Çimi Silajı",      "silage",    5.0, 30.0,   3.9,  690, 50.0,   6.0,   3.0, 25.0,   2.0,   3.5,   20),  # NRC
-    ("Ot Silajı",                "silage",    4.0, 30.0,   4.0,  600, 55.0,   6.0,   3.0, 25.0,   2.0,   3.5,   20),  # tahmini
-    ("Korunga Silajı",           "silage",    4.5, 30.0,   3.5,  500, 45.0,  12.0,   2.5, 25.0,   2.0,   3.0,   30),  # tahmini
+    ("Yonca Silajı",             "silage",    4.5, 35.0,   6.3,  788, 45.0,  13.0,   3.0, 25.0,   2.0,   3.0,   20),  # NRC
+    ("Arpa Hasılı Silajı",       "silage",    3.0, 30.0,   3.0,  660, 55.0,   4.0,   2.5, 25.0,  15.0,   3.0,   22),  # NRC
+    ("İtalyan Çimi Silajı",      "silage",    3.3, 30.0,   3.9,  690, 50.0,   6.0,   3.0, 25.0,   2.0,   3.5,   20),  # NRC
+    ("Ot Silajı",                "silage",    2.8, 30.0,   4.0,  600, 55.0,   6.0,   3.0, 25.0,   2.0,   3.5,   20),  # tahmini
+    ("Korunga Silajı",           "silage",    2.8, 30.0,   3.5,  500, 45.0,  12.0,   2.5, 25.0,   2.0,   3.0,   30),  # tahmini
     ("Yulaf Samanı",             "straw",     5.5, 90.0,   5.0, 2000, 70.0,   2.5,   1.0,  4.0,   2.0,   2.0,   35),  # tahmini
     ("Mercimek Samanı",          "straw",     6.0, 90.0,  12.0, 1000, 60.0,  10.0,   1.5,  4.0,   1.0,   1.5,   30),  # tahmini
     ("Nohut Samanı",             "straw",     5.5, 90.0,   5.5, 1600, 65.0,   8.0,   1.2,  4.0,   1.0,   1.5,   30),  # tahmini

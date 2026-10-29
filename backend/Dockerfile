@@ -25,6 +25,8 @@ RUN pip install --no-cache-dir -r requirements-backend.txt
 # Uygulama kaynağı ve RAG kaynak dokümanları
 COPY backend/ ./backend/
 COPY data/docs/ ./data/docs/
+# Kullanıcının rasyon notları da bilgi tabanına girer (fotoğraflar .dockerignore'da).
+COPY data/notlar/rasyon_notlari.md ./data/notlar/rasyon_notlari.md
 
 RUN chown -R app:app /app
 USER app

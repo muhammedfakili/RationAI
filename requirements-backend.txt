@@ -22,9 +22,9 @@ beautifulsoup4==4.15.0
 # TOBB sunucusu ara sertifikayı göndermiyor; zincir AIA ile tamamlanıp doğrulanıyor.
 cryptography==49.0.0
 
-# RAG + ajan
+# RAG (metin bölme langchain-text-splitters ile; langchain-core onun bağımlılığı)
 chromadb==1.5.9
 langchain-core==1.4.9
-langchain-groq==1.1.3
 langchain-text-splitters==1.1.2
-langgraph==1.2.9
+# Sohbet ajanı OpenAI uyumlu API'yi (NVIDIA NIM / Groq) doğrudan `requests` ile çağırır;
+# langgraph ve langchain-groq artık kullanılmıyor.

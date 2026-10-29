@@ -45,7 +45,7 @@ def main() -> int:
     env_file = BASE_DIR / ".env"
     if not env_file.exists():
         shutil.copy(BASE_DIR / ".env.example", env_file)
-        print("[BİLGİ] .env, .env.example'dan oluşturuldu. Sohbet için GROQ_API_KEY ekleyebilirsin (opsiyonel).")
+        print("[BİLGİ] .env, .env.example'dan oluşturuldu. Sohbet için NVIDIA_API_KEY ya da GROQ_API_KEY ekleyebilirsin (opsiyonel).")
 
     print("[1/3] Veritabanı hazırlanıyor...")
     subprocess.run([python, "-m", "backend.app.database"], cwd=BASE_DIR, check=True)

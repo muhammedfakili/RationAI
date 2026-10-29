@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-RationAI - Süt ineği rasyon optimizasyonu arayüzü.
+RationAI arayüzü.
 
-Tek sayfa: hayvan profili (kenar çubuğu) -> yem seçimi -> rasyon sonucu.
-Hesaplama deterministik `/api/v1/optimize` uç noktasına gider, LLM devrede değildir.
+Üst menüde üç sayfa (st.navigation, position="top"): Günlük rasyon, Karma yem, Besi ekonomisi.
+Her sayfanın başlığında "Asistan" düğmesi sohbet penceresini (st.dialog) açar.
+Hesaplar deterministik uç noktalara gider; LLM yalnız asistanda devrededir.
 """
 
 import os
@@ -44,10 +45,12 @@ DEFAULT_LAMB_MINERALS = ("Mermer Tozu", "Tuz", "Koyun Premiksi (Bakırsız)", "A
 
 st.set_page_config(
     page_title="RationAI",
-    page_icon=":material/agriculture:",
+    page_icon=":material/eco:",
     layout="centered",
     initial_sidebar_state="expanded",
 )
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+st.logo(os.path.join(_ASSETS, "logo.svg"), size="large", icon_image=os.path.join(_ASSETS, "icon.svg"))
 
 
 # ============================
@@ -234,8 +237,11 @@ def _apply_advice(keys: Dict[str, str], add: List[str], remove: List[str],
     st.session_state[flag] = True
 
 
-def render_advice(advice: List[Dict], keys: Dict[str, str], flag: str) -> None:
-    """Öneri listesi; yem ekleyen/çıkaran önerinin yanında "Öneriyi uygula" düğmesi."""
+def render_advice(advice: List[Dict], keys: Optional[Dict[str, str]], flag: str) -> None:
+    """Öneri listesi; yem ekleyen/çıkaran önerinin yanında "Öneriyi uygula" düğmesi.
+
+    `keys` None ise (sohbetteki sonuç) düğme gösterilmez — seçim kutuları o ekranda değil.
+    """
     if not advice:
         return
     feed_types = {f["name"]: f.get("feed_type") for f in fetch_feeds()}
@@ -244,7 +250,7 @@ def render_advice(advice: List[Dict], keys: Dict[str, str], flag: str) -> None:
         icon, label = _ADVICE_STYLE.get(item["kind"], (":material/lightbulb:", "Öneri"))
         with st.container(border=True, horizontal=True, vertical_alignment="center"):
             st.markdown(f"{icon} **{label}** — {item['text']}", width="stretch")
-            if item.get("add") or item.get("remove"):
+            if keys and (item.get("add") or item.get("remove")):
                 st.button("Uygula", key=f"{flag}_apply_{i}", icon=":material/done:",
                           on_click=_apply_advice,
                           args=(keys, item.get("add") or [], item.get("remove") or [], feed_types, flag),
@@ -420,8 +426,9 @@ def render_results(result: Dict, targets: Dict, advice_keys: Optional[Dict[str, 
                 else:
                     st.badge("Aralık dışı", icon=":material/priority_high:", color="orange")
 
+    render_advice(result.get("advice") or [], advice_keys, "auto_calc_ration")
     if advice_keys:
-        render_advice(result.get("advice") or [], advice_keys, "auto_calc_ration")
+        render_ask_box("ration", result)
 
     # --- Detaylar ---
     with st.expander("Detaylar", icon=":material/expand_more:"):
@@ -649,7 +656,7 @@ def fetch_compound_types() -> List[Dict]:
         return []
 
 
-def render_compound_result(result: Dict) -> None:
+def render_compound_result(result: Dict, actionable: bool = True) -> None:
     """Defterdeki gibi: hammadde, kg, HP ve ME katkısı; altta toplamlar ve hedef kontrolü."""
     target = result["target"]
     mode = result["mode"]
@@ -715,8 +722,10 @@ def render_compound_result(result: Dict) -> None:
                     st.badge("Aralık dışı", icon=":material/priority_high:", color="orange")
     st.caption("Ca ve P aralıkları taslaktır: üretici etiketlerindeki değerlerden alındı.")
     render_advice(result.get("advice") or [],
-                  {"concentrate": "compound_ingredients", "mineral": "compound_minerals"},
+                  {"concentrate": "compound_ingredients", "mineral": "compound_minerals"} if actionable else None,
                   "auto_calc_compound")
+    if actionable:
+        render_ask_box("compound", result)
 
 
 def render_compound_feed_page() -> None:
@@ -732,6 +741,7 @@ def render_compound_feed_page() -> None:
             "Yem tipi", options=list(types_by_key),
             format_func=lambda key: types_by_key[key]["label"],
             help="Hedefler rasyon notlarındaki HP → ME tablosundan gelir (doğal hal).",
+            key="compound_type",
         )
         target = types_by_key[type_key]
         custom = st.toggle("Özel hedef", value=False,
@@ -755,11 +765,11 @@ def render_compound_feed_page() -> None:
         st.caption(f"Ca %{target['ca_min']}–{target['ca_max']} · P en az %{target['p_min']}"
                    + (" · besi yemi: soya küspesi yok, dane:küspe ≥ 6:1"
                       if target["fattening"] else ""))
-        batch_kg = st.number_input("Karışım miktarı (kg)", 100.0, 50000.0, 1000.0, 100.0)
+        batch_kg = st.number_input("Karışım miktarı (kg)", 100.0, 50000.0, 1000.0, 100.0,
+                                   key="compound_batch")
         render_price_sync()
 
-    st.title("RationAI")
-    st.caption("Karma yem (konsantre) — hedefi tutturan en ucuz karışım")
+    page_header("Karma yem", "Hedef protein ve enerjiyi tutturan en ucuz karışım (1 ton ya da istediğin miktar).")
 
     feeds_data = fetch_feeds()
     if not feeds_data:
@@ -801,7 +811,9 @@ def render_compound_feed_page() -> None:
                 st.error(f"API bağlantı hatası: {exc}", icon=":material/error:")
                 response = None
         if response is not None and response.status_code == 200:
-            st.session_state["compound_result"] = response.json()
+            st.session_state["compound_result"] = {
+                **response.json(),
+                "request": {"type_key": type_key, "selected_feed_names": selected, "batch_kg": batch_kg}}
         elif response is not None:
             st.error(f"Hesaplama hatası: {response.text}", icon=":material/error:")
             st.session_state.pop("compound_result", None)
@@ -842,7 +854,7 @@ def _price_caption(row: Dict) -> str:
     return f"{row['price_source']}" + (f" · {age} günlük" if age is not None else "")
 
 
-def render_economics_result(result: Dict) -> None:
+def render_economics_result(result: Dict, actionable: bool = True) -> None:
     """Kâr özeti, kalem kalem maliyet tablosu ve besi ortası rasyonu."""
     per_head, herd = result["per_head"], result["herd"]
     lamb = result["species"] == "lamb"
@@ -898,7 +910,9 @@ def render_economics_result(result: Dict) -> None:
     species = result["species"]
     render_advice(result.get("advice") or [],
                   {"forage": f"econ_forage_{species}", "concentrate": f"econ_conc_{species}",
-                   "mineral": f"econ_minerals_{species}"}, "auto_calc_econ")
+                   "mineral": f"econ_minerals_{species}"} if actionable else None, "auto_calc_econ")
+    if actionable:
+        render_ask_box("economics", result)
 
     ration = result["ration"]
     with st.expander(f"Besi ortası rasyonu ({result['mid_weight_kg']:.1f} kg) — "
@@ -942,8 +956,7 @@ def render_economics_page() -> None:
                       help="Yem tüketimi ve maliyeti bu ağırlığın rasyonundan hesaplanır.")
         render_price_sync()
 
-    st.title("RationAI")
-    st.caption("Besi ekonomisi — bir besi döneminin maliyeti, geliri ve kârı")
+    page_header("Besi ekonomisi", "Bir besi döneminin maliyeti, geliri ve kârı — kesim fiyatı UKON'dan.")
 
     feeds_data = fetch_feeds()
     market = fetch_market_prices()
@@ -1057,7 +1070,7 @@ def render_economics_page() -> None:
                 st.error(f"API bağlantı hatası: {exc}", icon=":material/error:")
                 response = None
         if response is not None and response.status_code == 200:
-            st.session_state["econ_result"] = response.json()
+            st.session_state["econ_result"] = {**response.json(), "request": payload}
         elif response is not None:
             st.error(f"Hesaplama hatası: {response.json().get('detail', response.text)}",
                      icon=":material/error:")
@@ -1071,322 +1084,560 @@ def render_economics_page() -> None:
 
 
 # ============================
-# MOD SEÇİMİ — günlük rasyon, karma yem ya da besi ekonomisi
+# SOHBET — LLM ajanı (/agent/query): geçmiş + ekrandaki son sonuç bağlam olarak gider
 # ============================
 
-with st.sidebar:
-    app_mode = st.segmented_control(
-        "Ne hesaplayalım?", options=["Günlük rasyon", "Karma yem", "Besi ekonomisi"],
-        default="Günlük rasyon", key="app_mode",
-    ) or "Günlük rasyon"
-
-if app_mode == "Karma yem":
-    render_compound_feed_page()
-    st.stop()
-if app_mode == "Besi ekonomisi":
-    render_economics_page()
-    st.stop()
+CHAT_EXAMPLES = (
+    "650 kilo, günde 30 litre süt veren ineğim var; elimde mısır silajı, saman, arpa ve soya var. Rasyon hazırla.",
+    "Kuru dönemdeki ineğe neden yonca verilmez?",
+    "Arpa, mısır, kepek ve ayçiçeği küspesiyle 1 ton %21 süt yemi yap.",
+    "220 kiloluk 114 danayı günde 1,5 kilo artışla 270 gün beslesem ne kazanırım?",
+)
+_CONTEXT_LABEL = {"ration": "günlük rasyon", "compound": "karma yem", "economics": "besi ekonomisi"}
+_OPEN_LABEL = {"ration": "Günlük rasyon ekranında aç", "compound": "Karma yem ekranında aç",
+               "economics": "Besi ekonomisi ekranında aç"}
 
 
-# ============================
-# KENAR ÇUBUĞU - HAYVAN PROFİLİ
-# ============================
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_health() -> Dict:
+    try:
+        return requests.get(f"{BACKEND_URL}/health", timeout=10).json()
+    except Exception:
+        return {}
 
-with st.sidebar:
-    st.subheader("Hayvan profili")
 
-    group = st.segmented_control(
-        "Hayvan grubu",
-        options=list(GROUP_LABELS),
-        format_func=GROUP_LABELS.get,
-        default="lactating",
-        help="Kuru dönemin rasyon kuralları farklıdır: daha fazla lif ve saman, daha az enerji. "
-             "Besi sığırı ve kuzuda kaba yem besi başında %50, 20 günde %30'a iner.",
-    ) or "lactating"
-    lactating = group == "lactating"
-    beef = group == "beef"
-    lamb = group == "lamb"
+def targets_from_requirements(req: Dict) -> Dict:
+    """Otomatik moddaki hedefler (sonuç kartları bunlara göre "hedefte" der)."""
+    return {
+        "manual": False,
+        "dm_intake_kg": req["dm_intake_kg"],
+        "cp_min": req["cp_min"], "cp_max": req["cp_max"],
+        "starch_max": req["starch_max"], "fat_max": req["fat_max"],
+        "me_min": req["me_min"] * 1000, "me_max": req["me_max"] * 1000,     # kcal/kg KM
+        "ca_min": req["calcium_min"] / 10, "ca_max": req["calcium_max"] / 10,
+        "p_min": req["phosphorus_min"] / 10, "p_max": req["phosphorus_max"] / 10,
+        "ca_p_min": req["ca_p_ratio_min"], "ca_p_max": req["ca_p_ratio_max"],
+        # Günlük ihtiyaçlar (Detaylar tablosu): ME Mcal, HP/Ca/P g.
+        "me_day": req["me_mcal_day"], "cp_day": req["cp_min"] * req["dm_intake_kg"] * 10,
+        "ca_day": req["calcium_g_day"], "p_day": req["phosphorus_g_day"],
+        "water_l_day": req["water_l_day"],
+        # Grubun rasyon kuralları — sonuç kartları bunlara göre "hedefte" der.
+        "ndf_min": req["ndf_min"], "ndf_max": req["ndf_max"],
+        "forage_min": req["forage_ratio_min"], "forage_max": req["forage_ratio_max"],
+    }
 
-    # Her tür için ayrı anahtar: kuzu 30 kg'da, dana 400 kg'da, inek 650 kg'da kalır.
-    if lamb:
-        body_weight = st.number_input("Canlı ağırlık (kg)", 10.0, 80.0, 30.0, 1.0, key="bw_lamb")
-    else:
-        body_weight = st.number_input(
-            "Canlı ağırlık (kg)", min_value=100.0 if beef else 300.0, max_value=1000.0,
-            value=400.0 if beef else 650.0, step=25.0, key="bw_beef" if beef else "bw_cow",
-        )
-    milk_yield = st.number_input(
-        "Günlük süt verimi (kg)", min_value=0.0, max_value=70.0, value=30.0, step=1.0
-    ) if lactating else 0.0
-    daily_gain, days_on_feed = 1.4, 60
-    if beef or lamb:
-        if lamb:
-            daily_gain = st.number_input("Hedef günlük canlı ağırlık artışı (g)", 50, 500, 300, 10) / 1000
+
+def _ask_about(kind: str, data: Dict) -> None:
+    """"Bu sonuç hakkında sor": soruyu ve sonucu sohbete taşır (on_click geri çağırması)."""
+    question = (st.session_state.get(f"ask_{kind}") or "").strip()
+    if not question:
+        return
+    st.session_state[f"ask_{kind}"] = ""
+    st.session_state["chat_context"] = {"kind": kind, "data": data}
+    st.session_state["chat_pending"] = question
+    st.session_state["open_assistant"] = True
+
+
+def render_ask_box(kind: str, data: Dict) -> None:
+    """Sonucun altında küçük soru kutusu; LLM anahtarı yoksa gösterilmez."""
+    if not fetch_health().get("llm_available"):
+        return
+    with st.container(border=True):
+        st.markdown(":material/forum: **Bu sonuç hakkında sor**")
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.text_input("Soru", key=f"ask_{kind}", label_visibility="collapsed",
+                          placeholder="Ör. neden saman bu kadar az? Arpa yerine buğday koysam?")
+            st.button("Sor", key=f"ask_btn_{kind}", icon=":material/send:",
+                      on_click=_ask_about, args=(kind, data))
+
+
+def _split_by_box(names: List[str]) -> Dict[str, List[str]]:
+    types = {f["name"]: f.get("feed_type") for f in fetch_feeds()}
+    boxes: Dict[str, List[str]] = {"forage": [], "concentrate": [], "mineral": []}
+    for name in names:
+        if name in types:
+            boxes[_feed_box(types[name])].append(name)
+    return boxes
+
+
+def _open_in_screen(result: Dict) -> None:
+    """Sohbetteki sonucu ilgili sayfaya taşır: girdileri doldurur ve yeniden hesaplatır.
+
+    Pencerenin içinden düz düğmeyle çağrılır (geri çağırma değil) ve ardından tüm uygulama
+    yeniden çalıştırılır: pencere kapanır, `goto` ilgili sayfaya geçirir.
+    """
+    kind, data = result["kind"], result["data"]
+    request = data.get("request") or {}
+    boxes = _split_by_box(request.get("selected_feed_names") or [])
+    if kind == "ration":
+        animal = request.get("animal") or {}
+        group = animal.get("group", "lactating")
+        st.session_state["ration_group"] = group
+        weight = float(animal.get("body_weight_kg", 650))
+        if group == "lamb":
+            st.session_state["bw_lamb"] = min(max(weight, 10.0), 80.0)
+            st.session_state["gain_lamb"] = int(min(max(round(animal.get("daily_gain_kg", 0.3) * 1000), 50), 500))
+        elif group == "beef":
+            st.session_state["bw_beef"] = min(max(weight, 100.0), 1000.0)
+            st.session_state["gain_beef"] = float(min(max(animal.get("daily_gain_kg", 1.4), 0.3), 2.5))
         else:
-            daily_gain = st.number_input("Hedef günlük canlı ağırlık artışı (kg)", 0.3, 2.5, 1.4, 0.1)
-        days_on_feed = st.number_input(
-            "Besinin kaçıncı günü", 1, 500, 60, 1,
-            help="İlk 20 günde kaba yem payı %50 → %45 → %40 → %35 → %30 iner (5 günde bir).",
-        )
+            st.session_state["bw_cow"] = min(max(weight, 300.0), 1000.0)
+        if group == "lactating":
+            st.session_state["milk_kg"] = float(min(max(animal.get("milk_kg", 30), 0.0), 70.0))
+        if group in ("beef", "lamb"):
+            st.session_state["days_on_feed"] = int(min(max(animal.get("days_on_feed", 60), 1), 500))
+        st.session_state["ration_forages"] = boxes["forage"]
+        st.session_state["ration_concentrates"] = boxes["concentrate"]
+        st.session_state["minerals_lamb" if group == "lamb" else "minerals_cattle"] = boxes["mineral"]
+        st.session_state["auto_calc_ration"] = True
+        st.session_state["goto"] = "ration"
+    elif kind == "compound":
+        st.session_state["compound_type"] = request.get("type_key", "sut_21")
+        st.session_state["compound_batch"] = float(request.get("batch_kg", 1000.0))
+        st.session_state["compound_ingredients"] = boxes["concentrate"]
+        st.session_state["compound_minerals"] = boxes["mineral"]
+        st.session_state["auto_calc_compound"] = True
+        st.session_state["goto"] = "compound"
+    elif kind == "economics":
+        species = request.get("species", "beef")
+        st.session_state["econ_species"] = species
+        st.session_state[f"econ_heads_{species}"] = int(request.get("head_count", 1))
+        weight = float(request.get("start_weight_kg", 300))
+        st.session_state[f"econ_bw_{species}"] = (min(max(weight, 10.0), 80.0) if species == "lamb"
+                                                  else min(max(weight, 100.0), 700.0))
+        gain = float(request.get("daily_gain_kg", 1.4))
+        if species == "lamb":
+            st.session_state["econ_gain_lamb"] = int(min(max(round(gain * 1000), 50), 500))
+        else:
+            st.session_state["econ_gain_beef"] = min(max(gain, 0.3), 2.5)
+        st.session_state[f"econ_days_{species}"] = int(min(max(request.get("days", 180), 10), 600))
+        st.session_state[f"econ_forage_{species}"] = boxes["forage"]
+        st.session_state[f"econ_conc_{species}"] = boxes["concentrate"]
+        st.session_state[f"econ_minerals_{species}"] = boxes["mineral"]
+        st.session_state["auto_calc_econ"] = True
+        st.session_state["goto"] = "economics"
 
-    fat_pct, protein_pct, days_in_milk, days_pregnant = 3.8, 3.2, 120, 0
-    first_lactation, bcs = False, 3.0
-    if not (beef or lamb):
-        with st.expander("Hayvan detayları", icon=":material/pets:"):
-            nasem_only = "Yalnızca NASEM 2021 karşılaştırma notunda kullanılır."
-            if lactating:
+
+def _render_chat_result(result: Dict) -> None:
+    """Sohbetteki hesap sonucu, ekranlardaki aynı bileşenlerle (öneri düğmeleri olmadan)."""
+    kind, data = result.get("kind"), result.get("data") or {}
+    if kind == "ration":
+        animal = (data.get("request") or {}).get("animal")
+        req = fetch_requirements(animal) if animal else None
+        if req:
+            render_results(data, targets_from_requirements(req))
+    elif kind == "compound":
+        render_compound_result(data, actionable=False)
+    elif kind == "economics":
+        render_economics_result(data, actionable=False)
+
+
+def page_header(title: str, caption: str) -> None:
+    """Sayfa başlığı; sağında asistan düğmesi (LLM anahtarı yoksa düğme yok)."""
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.title(title, width="stretch")
+        if fetch_health().get("llm_available") and st.button(
+                "Asistan", icon=":material/support_agent:", key="assistant_button",
+                help="Soru sor ya da rasyonu sohbetle hesaplat."):
+            st.session_state["open_assistant"] = True
+    st.caption(caption)
+
+
+def _pick_suggestion() -> None:
+    st.session_state["chat_pending"] = st.session_state.get("chat_suggestion")
+    st.session_state["chat_suggestion"] = None
+
+
+@st.dialog("RationAI asistan", width="large", icon=":material/support_agent:")
+def assistant_dialog() -> None:
+    """Sohbet penceresi. İçindeki etkileşimler yalnız pencereyi yeniden çalıştırır (fragment)."""
+    chat = st.session_state.setdefault("chat", [])
+    context = st.session_state.get("chat_context")
+
+    with st.container(horizontal=True, vertical_alignment="center"):
+        model = next((m.get("model") for m in reversed(chat) if m.get("model")), None)
+        note = (f":material/push_pin: Bağlam: son {_CONTEXT_LABEL.get(context['kind'], 'sonuç')}"
+                if context else "Rasyon, karma yem, besi kârı ya da besleme sorusu sor.")
+        st.caption(note + (f" · {model}" if model else ""), width="stretch")
+        if context and st.button("Bağlamı kaldır", icon=":material/link_off:", type="tertiary"):
+            st.session_state.pop("chat_context", None)
+            st.rerun(scope="fragment")
+        if chat and st.button("Temizle", icon=":material/delete_sweep:", type="tertiary"):
+            st.session_state["chat"] = []
+            st.session_state.pop("chat_context", None)
+            st.rerun(scope="fragment")
+
+    history = st.container(height=520, border=False)
+    with history:
+        if not chat:
+            st.pills("Örnek sorular", CHAT_EXAMPLES, key="chat_suggestion", label_visibility="collapsed",
+                     on_change=_pick_suggestion)
+        for i, message in enumerate(chat):
+            avatar = ":material/support_agent:" if message["role"] == "assistant" else ":material/person:"
+            with st.chat_message(message["role"], avatar=avatar):
+                st.markdown(message["content"])
+                if message.get("sources"):
+                    st.caption(":material/menu_book: Kaynak: " + ", ".join(message["sources"]))
+                result = message.get("result")
+                if result:
+                    with st.container(border=True):
+                        _render_chat_result(result)
+                        if st.button(_OPEN_LABEL.get(result["kind"], "Sayfada aç"), key=f"chat_open_{i}",
+                                     icon=":material/open_in_new:"):
+                            _open_in_screen(result)
+                            st.rerun()          # tüm uygulama: pencere kapanır, sayfa değişir
+
+    prompt = st.chat_input("Sorunu yaz…", submit_mode="disable") or st.session_state.pop("chat_pending", None)
+    if not prompt:
+        return
+    past = [{"role": m["role"], "content": m["content"]} for m in chat if not m.get("error")]
+    chat.append({"role": "user", "content": prompt})
+    with history:
+        with st.chat_message("user", avatar=":material/person:"):
+            st.markdown(prompt)
+        with st.chat_message("assistant", avatar=":material/support_agent:"):
+            with st.spinner("Düşünüyor… (hesap gerekiyorsa çözücü çalışıyor)"):
+                try:
+                    response = requests.post(
+                        f"{BACKEND_URL}/agent/query", timeout=300,
+                        json={"query": prompt, "history": past, "context": st.session_state.get("chat_context")})
+                    error = None
+                except Exception as exc:
+                    response, error = None, str(exc)
+    if response is not None and response.status_code == 200:
+        data = response.json()
+        chat.append({"role": "assistant", "content": data.get("answer") or "", "sources": data.get("sources") or [],
+                     "result": data.get("result"), "model": data.get("model")})
+        if data.get("result"):
+            st.session_state["chat_context"] = data["result"]
+    else:
+        detail = (response.json().get("detail", response.text) if response is not None else error)
+        chat.append({"role": "assistant", "content": f"Şu an cevap veremedim: {detail}", "error": True})
+    st.rerun(scope="fragment")
+
+
+def render_ration_page() -> None:
+    """Günlük rasyon sayfası: hayvan profili (kenar) → yem seçimi → sonuç."""
+    # ============================
+    # KENAR ÇUBUĞU - HAYVAN PROFİLİ
+    # ============================
+
+    with st.sidebar:
+        st.subheader("Hayvan profili")
+
+        group = st.segmented_control(
+            "Hayvan grubu",
+            options=list(GROUP_LABELS),
+            format_func=GROUP_LABELS.get,
+            default="lactating",
+            key="ration_group",
+            help="Kuru dönemin rasyon kuralları farklıdır: daha fazla lif ve saman, daha az enerji. "
+                 "Besi sığırı ve kuzuda kaba yem besi başında %50, 20 günde %30'a iner.",
+        ) or "lactating"
+        lactating = group == "lactating"
+        beef = group == "beef"
+        lamb = group == "lamb"
+
+        # Her tür için ayrı anahtar: kuzu 30 kg'da, dana 400 kg'da, inek 650 kg'da kalır.
+        if lamb:
+            body_weight = st.number_input("Canlı ağırlık (kg)", 10.0, 80.0, 30.0, 1.0, key="bw_lamb")
+        else:
+            body_weight = st.number_input(
+                "Canlı ağırlık (kg)", min_value=100.0 if beef else 300.0, max_value=1000.0,
+                value=400.0 if beef else 650.0, step=25.0, key="bw_beef" if beef else "bw_cow",
+            )
+        milk_yield = st.number_input(
+            "Günlük süt verimi (kg)", min_value=0.0, max_value=70.0, value=30.0, step=1.0, key="milk_kg"
+        ) if lactating else 0.0
+        daily_gain, days_on_feed = 1.4, 60
+        if beef or lamb:
+            if lamb:
+                daily_gain = st.number_input("Hedef günlük canlı ağırlık artışı (g)", 50, 500, 300, 10,
+                                             key="gain_lamb") / 1000
+            else:
+                daily_gain = st.number_input("Hedef günlük canlı ağırlık artışı (kg)", 0.3, 2.5, 1.4, 0.1,
+                                             key="gain_beef")
+            days_on_feed = st.number_input(
+                "Besinin kaçıncı günü", 1, 500, 60, 1, key="days_on_feed",
+                help="İlk 20 günde kaba yem payı %50 → %45 → %40 → %35 → %30 iner (5 günde bir).",
+            )
+
+        fat_pct, protein_pct, days_in_milk, days_pregnant = 3.8, 3.2, 120, 0
+        first_lactation, bcs = False, 3.0
+        if not (beef or lamb):
+            with st.expander("Hayvan detayları", icon=":material/pets:"):
+                nasem_only = "Yalnızca NASEM 2021 karşılaştırma notunda kullanılır."
+                if lactating:
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        fat_pct = st.number_input("Süt yağı (%)", 2.0, 6.5, 3.8, 0.1)
+                        days_in_milk = st.number_input("Laktasyon günü", 1, 600, 120, 5, help=nasem_only)
+                    with col_b:
+                        protein_pct = st.number_input("Süt proteini (%)", 2.4, 4.5, 3.2, 0.1,
+                                                      help=nasem_only)
+                        days_pregnant = st.number_input(
+                            "Gebelik günü", 0, 285, 0, 10,
+                            help="0 = gebe değil. 190. günden itibaren yaşama payı enerjisine %30 eklenir.",
+                        )
+                else:
+                    fat_pct, protein_pct, days_in_milk = 3.8, 3.2, 120
+                    days_pregnant = st.number_input(
+                        "Gebelik günü", 150, 285, 230 if group == "dry_faroff" else 265, 5,
+                        help="Doğuma ~3 haftadan az kaldıysa 'Kuru (doğuma yakın)' grubunu seç.",
+                    )
+                first_lactation = st.toggle(
+                    "İlk laktasyon / düve" if lactating else "Düve (ilk doğum)", value=False
+                )
+                bcs = st.slider("Vücut kondisyon skoru (BCS)", 1.0, 5.0, 3.0, 0.25, help=nasem_only)
+
+        animal = {
+            "group": group,
+            "body_weight_kg": body_weight,
+            "milk_kg": milk_yield,
+            "fat_pct": fat_pct,
+            "true_protein_pct": protein_pct,
+            "days_in_milk": int(days_in_milk),
+            "multiparous": not first_lactation,
+            "bcs": bcs,
+            "days_pregnant": int(days_pregnant),
+            "daily_gain_kg": float(daily_gain),
+            "days_on_feed": int(days_on_feed),
+        }
+        req = fetch_requirements(animal)
+        if req is None:
+            st.stop()
+
+        with st.container(horizontal=True):
+            st.metric("Kuru madde", f"{req['dm_intake_kg']:.2f} kg" if lamb else f"{req['dm_intake_kg']:.1f} kg",
+                      border=True)
+            st.metric("ME", f"{req['me_mcal_day'] * 1000:,.0f}", border=True,
+                      help=f"Günlük metabolik enerji ihtiyacı, kcal · hedef "
+                           f"{req['me_min'] * 1000:,.0f} kcal/kg KM")
+        # Solver'ın uyguladığı HP hedefi: kuru dönemde formül yalnızca yaşama payını verir,
+        # %12-13 KM tabanı devreye girer; çok yüksek verimde tavan uygulanır.
+        cp_target_g = req["cp_min"] * req["dm_intake_kg"] * 10
+        with st.container(horizontal=True):
+            st.metric("Ham protein", f"{cp_target_g:,.0f} g", border=True,
+                      help=f"Günlük HP hedefi · %{req['cp_min']:.1f} KM · formüle göre ihtiyaç "
+                           f"{req['cp_g_day']:,.0f} g")
+            st.metric("Su", f"{req['water_l_day']:.1f} L" if lamb else f"{req['water_l_day']:.0f} L",
+                      border=True,
+                      help="Günlük içme suyu ihtiyacı · koyunda KM tüketiminin ~2.5 katı" if lamb else
+                           "Günlük içme suyu ihtiyacı: 12.3 + 2.15 × KMT + 0.73 × süt")
+        st.caption("Hedefler rasyon notlarındaki formüllerle (ME + HP) hesaplanır.")
+        for note in req["notes"]:
+            st.caption(f":material/info: {note}")
+
+        with st.expander("Gelişmiş ayarlar", icon=":material/tune:"):
+            manual_targets = st.toggle(
+                "Besin hedeflerini elle ayarla",
+                value=False,
+                help="Kapalıyken hedefler hayvan profilinden otomatik hesaplanır.",
+            )
+
+            if manual_targets:
+                dm_intake = st.number_input(
+                    "Günlük kuru madde tüketimi (kg)",
+                    min_value=5.0, max_value=35.0, value=float(req["dm_intake_kg"]), step=0.5,
+                )
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    fat_pct = st.number_input("Süt yağı (%)", 2.0, 6.5, 3.8, 0.1)
-                    days_in_milk = st.number_input("Laktasyon günü", 1, 600, 120, 5, help=nasem_only)
+                    cp_min = st.number_input("Min ham protein (% KM)", 5.0, 30.0,
+                                             float(round(req["cp_min"], 1)), 0.5)
+                    me_min = st.number_input("Min ME (kcal/kg KM)", 1500, 3500,
+                                             int(round(req["me_min"] * 1000, -1)), 10)
+                    ca_min = st.number_input("Min kalsiyum (% KM)", 0.1, 2.0,
+                                             req["calcium_min"] / 10, 0.05)
+                    p_min = st.number_input("Min fosfor (% KM)", 0.1, 1.5,
+                                            req["phosphorus_min"] / 10, 0.05)
                 with col_b:
-                    protein_pct = st.number_input("Süt proteini (%)", 2.4, 4.5, 3.2, 0.1,
-                                                  help=nasem_only)
-                    days_pregnant = st.number_input(
-                        "Gebelik günü", 0, 285, 0, 10,
-                        help="0 = gebe değil. 190. günden itibaren yaşama payı enerjisine %30 eklenir.",
-                    )
+                    cp_max = st.number_input("Max ham protein (% KM)", 8.0, 35.0,
+                                             float(round(req["cp_max"], 1)), 0.5)
+                    me_max = st.number_input("Max ME (kcal/kg KM)", 1600, 4000,
+                                             int(round(req["me_max"] * 1000, -1)), 10)
+                    ca_max = st.number_input("Max kalsiyum (% KM)", 0.3, 3.0,
+                                             req["calcium_max"] / 10, 0.05)
+                    p_max = st.number_input("Max fosfor (% KM)", 0.2, 2.0,
+                                            req["phosphorus_max"] / 10, 0.05)
             else:
-                fat_pct, protein_pct, days_in_milk = 3.8, 3.2, 120
-                days_pregnant = st.number_input(
-                    "Gebelik günü", 150, 285, 230 if group == "dry_faroff" else 265, 5,
-                    help="Doğuma ~3 haftadan az kaldıysa 'Kuru (doğuma yakın)' grubunu seç.",
-                )
-            first_lactation = st.toggle(
-                "İlk laktasyon / düve" if lactating else "Düve (ilk doğum)", value=False
-            )
-            bcs = st.slider("Vücut kondisyon skoru (BCS)", 1.0, 5.0, 3.0, 0.25, help=nasem_only)
+                dm_intake = req["dm_intake_kg"]
+                cp_min, cp_max = req["cp_min"], req["cp_max"]
+                me_min, me_max = req["me_min"] * 1000, req["me_max"] * 1000
+                ca_min, ca_max = req["calcium_min"] / 10, req["calcium_max"] / 10
+                p_min, p_max = req["phosphorus_min"] / 10, req["phosphorus_max"] / 10
 
-    animal = {
-        "group": group,
-        "body_weight_kg": body_weight,
-        "milk_kg": milk_yield,
-        "fat_pct": fat_pct,
-        "true_protein_pct": protein_pct,
-        "days_in_milk": int(days_in_milk),
-        "multiparous": not first_lactation,
-        "bcs": bcs,
-        "days_pregnant": int(days_pregnant),
-        "daily_gain_kg": float(daily_gain),
-        "days_on_feed": int(days_on_feed),
+            ratio = ca_min / p_min if p_min > 0 else 0
+            st.caption(f"Hedeflenen Ca:P oranı {ratio:.2f} "
+                       f"(bu grupta {req['ca_p_ratio_min']}–{req['ca_p_ratio_max']})")
+
+            use_all_feeds = st.toggle(
+                "Seçili yemlerin tümünü kullan",
+                value=True,
+                help="Kapatırsan çözücü sadece en ucuz kombinasyonu seçer ve bazı yemleri "
+                     "hiç kullanmayabilir.",
+            )
+            min_inclusion_pct = st.slider(
+                "Yem başına minimum oran (% KM)",
+                min_value=1.0, max_value=8.0, value=3.0, step=0.5,
+                disabled=not use_all_feeds,
+                help="Mineraller için güvenlik tavanı otomatik uygulanır (tuz %3 olamaz).",
+            )
+
+            limit_dm = st.toggle(
+                "Rasyon kuru madde aralığını sınırla",
+                value=False,
+                help="Genelde gerekmez. Silaj kullanıyorsan rasyon KM'si %30-50 civarındadır; "
+                     "%85 gibi bir alt sınır modeli çözümsüz bırakır.",
+            )
+            dm_range = st.slider(
+                "Rasyon KM aralığı (% doğal hali)",
+                min_value=25.0, max_value=95.0, value=(40.0, 60.0), step=1.0,
+            ) if limit_dm else None
+
+        render_price_sync()
+
+    # Otomatik hedefler + "Gelişmiş ayarlar"da elle girilenler (kapalıyken aynı değerler).
+    targets = {
+        **targets_from_requirements(req),
+        "manual": manual_targets,
+        "dm_intake_kg": dm_intake,
+        "cp_min": cp_min, "cp_max": cp_max,
+        "me_min": me_min, "me_max": me_max,       # kcal/kg KM
+        "ca_min": ca_min, "ca_max": ca_max,
+        "p_min": p_min, "p_max": p_max,
+        "cp_day": cp_target_g,
     }
-    req = fetch_requirements(animal)
-    if req is None:
+
+
+    # ============================
+    # ANA EKRAN
+    # ============================
+
+    page_header("Günlük rasyon", "İhtiyacı tam karşılayan en ucuz rasyon — süt ineği, kuru dönem, "
+                "besi sığırı ve küçükbaş.")
+
+    feeds_data = fetch_feeds()
+    if not feeds_data:
+        st.error("Yem verileri yüklenemedi. Backend çalışıyor mu?", icon=":material/error:")
         st.stop()
 
-    with st.container(horizontal=True):
-        st.metric("Kuru madde", f"{req['dm_intake_kg']:.2f} kg" if lamb else f"{req['dm_intake_kg']:.1f} kg",
-                  border=True)
-        st.metric("ME", f"{req['me_mcal_day'] * 1000:,.0f}", border=True,
-                  help=f"Günlük metabolik enerji ihtiyacı, kcal · hedef "
-                       f"{req['me_min'] * 1000:,.0f} kcal/kg KM")
-    # Solver'ın uyguladığı HP hedefi: kuru dönemde formül yalnızca yaşama payını verir,
-    # %12-13 KM tabanı devreye girer; çok yüksek verimde tavan uygulanır.
-    cp_target_g = req["cp_min"] * req["dm_intake_kg"] * 10
-    with st.container(horizontal=True):
-        st.metric("Ham protein", f"{cp_target_g:,.0f} g", border=True,
-                  help=f"Günlük HP hedefi · %{req['cp_min']:.1f} KM · formüle göre ihtiyaç "
-                       f"{req['cp_g_day']:,.0f} g")
-        st.metric("Su", f"{req['water_l_day']:.1f} L" if lamb else f"{req['water_l_day']:.0f} L",
-                  border=True,
-                  help="Günlük içme suyu ihtiyacı · koyunda KM tüketiminin ~2.5 katı" if lamb else
-                       "Günlük içme suyu ihtiyacı: 12.3 + 2.15 × KMT + 0.73 × süt")
-    st.caption("Hedefler rasyon notlarındaki formüllerle (ME + HP) hesaplanır.")
-    for note in req["notes"]:
-        st.caption(f":material/info: {note}")
+    st.subheader("Yem seçimi")
 
-    with st.expander("Gelişmiş ayarlar", icon=":material/tune:"):
-        manual_targets = st.toggle(
-            "Besin hedeflerini elle ayarla",
-            value=False,
-            help="Kapalıyken hedefler hayvan profilinden otomatik hesaplanır.",
+
+    def _names_of(types) -> List[str]:
+        """Verilen yem sınıflarındaki yem adları (API'deki `feed_type` alanına göre)."""
+        return [feed["name"] for feed in feeds_data if feed.get("feed_type") in types]
+
+
+    forage_options = _names_of(FORAGE_TYPES)
+    concentrate_options = _names_of(CONCENTRATE_TYPES)
+    mineral_options = _names_of(MINERAL_TYPES)
+
+    col_forage, col_concentrate = st.columns(2)
+    with col_forage:
+        selected_forages = st.multiselect(
+            "Kaba yemler",
+            options=forage_options,
+            placeholder="Silaj, kuru ot, saman…",
+            # Yardım metni sabit kalmalı: gruba göre değişirse widget yeniden kurulur ve
+            # hayvan grubu değişince seçili kaba yemler siliniyordu.
+            help="Rasyonun kaba yem payı gruba göre: sağmal %45–65, kuru dönem %60–90, "
+                 "besi ve kuzu %30–60 (besi başında %50).",
+            key="ration_forages",   # "Öneriyi uygula" bu anahtarla seçimi değiştirir
+        )
+    with col_concentrate:
+        selected_concentrates = st.multiselect(
+            "Kesif yemler",
+            options=concentrate_options,
+            placeholder="Tahıl, küspe, kepek…",
+            key="ration_concentrates",
         )
 
-        if manual_targets:
-            dm_intake = st.number_input(
-                "Günlük kuru madde tüketimi (kg)",
-                min_value=5.0, max_value=35.0, value=float(req["dm_intake_kg"]), step=0.5,
-            )
-            col_a, col_b = st.columns(2)
-            with col_a:
-                cp_min = st.number_input("Min ham protein (% KM)", 5.0, 30.0,
-                                         float(round(req["cp_min"], 1)), 0.5)
-                me_min = st.number_input("Min ME (kcal/kg KM)", 1500, 3500,
-                                         int(round(req["me_min"] * 1000, -1)), 10)
-                ca_min = st.number_input("Min kalsiyum (% KM)", 0.1, 2.0,
-                                         req["calcium_min"] / 10, 0.05)
-                p_min = st.number_input("Min fosfor (% KM)", 0.1, 1.5,
-                                        req["phosphorus_min"] / 10, 0.05)
-            with col_b:
-                cp_max = st.number_input("Max ham protein (% KM)", 8.0, 35.0,
-                                         float(round(req["cp_max"], 1)), 0.5)
-                me_max = st.number_input("Max ME (kcal/kg KM)", 1600, 4000,
-                                         int(round(req["me_max"] * 1000, -1)), 10)
-                ca_max = st.number_input("Max kalsiyum (% KM)", 0.3, 3.0,
-                                         req["calcium_max"] / 10, 0.05)
-                p_max = st.number_input("Max fosfor (% KM)", 0.2, 2.0,
-                                        req["phosphorus_max"] / 10, 0.05)
-        else:
-            dm_intake = req["dm_intake_kg"]
-            cp_min, cp_max = req["cp_min"], req["cp_max"]
-            me_min, me_max = req["me_min"] * 1000, req["me_max"] * 1000
-            ca_min, ca_max = req["calcium_min"] / 10, req["calcium_max"] / 10
-            p_min, p_max = req["phosphorus_min"] / 10, req["phosphorus_max"] / 10
-
-        ratio = ca_min / p_min if p_min > 0 else 0
-        st.caption(f"Hedeflenen Ca:P oranı {ratio:.2f} "
-                   f"(bu grupta {req['ca_p_ratio_min']}–{req['ca_p_ratio_max']})")
-
-        use_all_feeds = st.toggle(
-            "Seçili yemlerin tümünü kullan",
-            value=True,
-            help="Kapatırsan çözücü sadece en ucuz kombinasyonu seçer ve bazı yemleri "
-                 "hiç kullanmayabilir.",
-        )
-        min_inclusion_pct = st.slider(
-            "Yem başına minimum oran (% KM)",
-            min_value=1.0, max_value=8.0, value=3.0, step=0.5,
-            disabled=not use_all_feeds,
-            help="Mineraller için güvenlik tavanı otomatik uygulanır (tuz %3 olamaz).",
-        )
-
-        limit_dm = st.toggle(
-            "Rasyon kuru madde aralığını sınırla",
-            value=False,
-            help="Genelde gerekmez. Silaj kullanıyorsan rasyon KM'si %30-50 civarındadır; "
-                 "%85 gibi bir alt sınır modeli çözümsüz bırakır.",
-        )
-        dm_range = st.slider(
-            "Rasyon KM aralığı (% doğal hali)",
-            min_value=25.0, max_value=95.0, value=(40.0, 60.0), step=1.0,
-        ) if limit_dm else None
-
-    render_price_sync()
-
-targets = {
-    "manual": manual_targets,
-    "dm_intake_kg": dm_intake,
-    "cp_min": cp_min, "cp_max": cp_max,
-    "starch_max": req["starch_max"], "fat_max": req["fat_max"],
-    "me_min": me_min, "me_max": me_max,       # kcal/kg KM
-    "ca_min": ca_min, "ca_max": ca_max,
-    "p_min": p_min, "p_max": p_max,
-    "ca_p_min": req["ca_p_ratio_min"], "ca_p_max": req["ca_p_ratio_max"],
-    # Günlük ihtiyaçlar (Detaylar tablosu): ME Mcal, HP/Ca/P g.
-    "me_day": req["me_mcal_day"], "cp_day": cp_target_g,
-    "ca_day": req["calcium_g_day"], "p_day": req["phosphorus_g_day"],
-    "water_l_day": req["water_l_day"],
-    # Grubun rasyon kuralları — sonuç kartları bunlara göre "hedefte" der.
-    "ndf_min": req["ndf_min"], "ndf_max": req["ndf_max"],
-    "forage_min": req["forage_ratio_min"], "forage_max": req["forage_ratio_max"],
-}
-
-
-# ============================
-# ANA EKRAN
-# ============================
-
-st.title("RationAI")
-st.caption("Süt ineği, besi sığırı ve kuzu besisi için en düşük maliyetli rasyon hesaplayıcı")
-
-feeds_data = fetch_feeds()
-if not feeds_data:
-    st.error("Yem verileri yüklenemedi. Backend çalışıyor mu?", icon=":material/error:")
-    st.stop()
-
-st.subheader("Yem seçimi")
-
-
-def _names_of(types) -> List[str]:
-    """Verilen yem sınıflarındaki yem adları (API'deki `feed_type` alanına göre)."""
-    return [feed["name"] for feed in feeds_data if feed.get("feed_type") in types]
-
-
-forage_options = _names_of(FORAGE_TYPES)
-concentrate_options = _names_of(CONCENTRATE_TYPES)
-mineral_options = _names_of(MINERAL_TYPES)
-
-col_forage, col_concentrate = st.columns(2)
-with col_forage:
-    selected_forages = st.multiselect(
-        "Kaba yemler",
-        options=forage_options,
-        placeholder="Silaj, kuru ot, saman…",
-        # Yardım metni sabit kalmalı: gruba göre değişirse widget yeniden kurulur ve
-        # hayvan grubu değişince seçili kaba yemler siliniyordu.
-        help="Rasyonun kaba yem payı gruba göre: sağmal %45–65, kuru dönem %60–90, "
-             "besi ve kuzu %30–60 (besi başında %50).",
-        key="ration_forages",   # "Öneriyi uygula" bu anahtarla seçimi değiştirir
-    )
-with col_concentrate:
-    selected_concentrates = st.multiselect(
-        "Kesif yemler",
-        options=concentrate_options,
-        placeholder="Tahıl, küspe, kepek…",
-        key="ration_concentrates",
+    # Koyun ve sığır için ayrı anahtar: varsayılanlar farklı ve tür değişince seçim korunur.
+    selected_minerals = st.multiselect(
+        "Mineraller",
+        options=mineral_options,
+        default=[name for name in (DEFAULT_LAMB_MINERALS if lamb else DEFAULT_MINERALS)
+                 if name in mineral_options],
+        help="Otomatik seçili gelir; miktarlarını çözücü Ca/P açığına göre belirler.",
+        key="minerals_lamb" if lamb else "minerals_cattle",
     )
 
-# Koyun ve sığır için ayrı anahtar: varsayılanlar farklı ve tür değişince seçim korunur.
-selected_minerals = st.multiselect(
-    "Mineraller",
-    options=mineral_options,
-    default=[name for name in (DEFAULT_LAMB_MINERALS if lamb else DEFAULT_MINERALS)
-             if name in mineral_options],
-    help="Otomatik seçili gelir; miktarlarını çözücü Ca/P açığına göre belirler.",
-    key="minerals_lamb" if lamb else "minerals_cattle",
-)
+    selected_feeds = selected_forages + selected_concentrates + selected_minerals
 
-selected_feeds = selected_forages + selected_concentrates + selected_minerals
-
-if selected_feeds and not selected_forages:
-    st.warning(
-        f"Hiç kaba yem seçmedin. Rumen sağlığı için rasyonun en az "
-        f"%{targets['forage_min']:.0f}'i kaba yem olmalı.",
-        icon=":material/warning:",
-    )
-
-price_overrides: Dict[str, float] = {}
-
-if selected_feeds:
-    price_overrides = render_price_editor(selected_feeds, feeds_data, body_weight,
-                                          tuple(req.get("health_cap_exempt") or ()))
-else:
-    st.info("Başlamak için en az bir yem seç.", icon=":material/info:")
-
-calculate = st.button(
-    "Rasyonu hesapla",
-    type="primary",
-    icon=":material/calculate:",
-    width="stretch",
-    disabled=not selected_feeds,
-)
-# "Öneriyi uygula" seçimi değiştirip bu bayrağı koyar: rasyon kendiliğinden yeniden hesaplanır.
-calculate = calculate or (st.session_state.pop("auto_calc_ration", False) and bool(selected_feeds))
-
-if calculate:
-    with st.spinner("Rasyon optimize ediliyor..."):
-        payload = build_optimization_payload(
-            selected_feeds=selected_feeds,
-            animal=animal,
-            targets=targets,
-            use_all_feeds=use_all_feeds,
-            min_inclusion_pct_dm=min_inclusion_pct,
-            price_overrides=price_overrides,
-            dm_range=dm_range,
+    if selected_feeds and not selected_forages:
+        st.warning(
+            f"Hiç kaba yem seçmedin. Rumen sağlığı için rasyonun en az "
+            f"%{targets['forage_min']:.0f}'i kaba yem olmalı.",
+            icon=":material/warning:",
         )
-        payload["with_advice"] = True
-        result = call_optimization_api(payload)
 
-    if result:
-        st.session_state["last_result"] = result
-        st.session_state["last_targets"] = targets
+    price_overrides: Dict[str, float] = {}
+
+    if selected_feeds:
+        price_overrides = render_price_editor(selected_feeds, feeds_data, body_weight,
+                                              tuple(req.get("health_cap_exempt") or ()))
     else:
-        st.session_state.pop("last_result", None)
+        st.info("Başlamak için en az bir yem seç.", icon=":material/info:")
 
-if "last_result" in st.session_state:
-    render_results(st.session_state["last_result"], st.session_state["last_targets"],
-                   {"forage": "ration_forages", "concentrate": "ration_concentrates",
-                    "mineral": "minerals_lamb" if lamb else "minerals_cattle"})
+    calculate = st.button(
+        "Rasyonu hesapla",
+        type="primary",
+        icon=":material/calculate:",
+        width="stretch",
+        disabled=not selected_feeds,
+    )
+    # "Öneriyi uygula" seçimi değiştirip bu bayrağı koyar: rasyon kendiliğinden yeniden hesaplanır.
+    calculate = calculate or (st.session_state.pop("auto_calc_ration", False) and bool(selected_feeds))
 
-st.caption("RationAI · FastAPI + PuLP · İhtiyaçlar ve HP/ME değerleri: rasyon notları · "
-           "Diğer besin değerleri: NRC 2001")
+    if calculate:
+        with st.spinner("Rasyon optimize ediliyor..."):
+            payload = build_optimization_payload(
+                selected_feeds=selected_feeds,
+                animal=animal,
+                targets=targets,
+                use_all_feeds=use_all_feeds,
+                min_inclusion_pct_dm=min_inclusion_pct,
+                price_overrides=price_overrides,
+                dm_range=dm_range,
+            )
+            payload["with_advice"] = True
+            result = call_optimization_api(payload)
+
+        if result:
+            # Sohbet bağlamı ve "Ekranda aç" için girdiler de saklanır.
+            result["request"] = {"animal": animal, "selected_feed_names": selected_feeds}
+            st.session_state["last_result"] = result
+            st.session_state["last_targets"] = targets
+        else:
+            st.session_state.pop("last_result", None)
+
+    if "last_result" in st.session_state:
+        render_results(st.session_state["last_result"], st.session_state["last_targets"],
+                       {"forage": "ration_forages", "concentrate": "ration_concentrates",
+                        "mineral": "minerals_lamb" if lamb else "minerals_cattle"})
+
+    st.caption("RationAI · FastAPI + PuLP · İhtiyaçlar ve HP/ME değerleri: rasyon notları · "
+               "Diğer besin değerleri: NRC 2001")
+
+
+# ============================
+# SAYFALAR — üst menü; asistan penceresi sayfadan sonra açılır
+# ============================
+
+PAGES = {
+    "ration": st.Page(render_ration_page, title="Günlük rasyon", icon=":material/grass:",
+                      url_path="rasyon", default=True),
+    "compound": st.Page(render_compound_feed_page, title="Karma yem", icon=":material/blender:",
+                        url_path="karma-yem"),
+    "economics": st.Page(render_economics_page, title="Besi ekonomisi", icon=":material/payments:",
+                         url_path="besi-ekonomisi"),
+}
+current_page = st.navigation(list(PAGES.values()), position="top")
+# Asistandaki "… sayfasında aç": girdiler yazıldı, şimdi o sayfaya geç.
+target = st.session_state.pop("goto", None)
+if target in PAGES:
+    st.switch_page(PAGES[target])
+current_page.run()
+if st.session_state.pop("open_assistant", False):
+    assistant_dialog()

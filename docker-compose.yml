@@ -1,8 +1,8 @@
 # RationAI — tek komutla ayağa kalkan tam yığın:
 #   cp .env.example .env  &&  docker compose up
 #
-# GROQ_API_KEY opsiyoneldir. Anahtarsız da arayüz, rasyon optimizasyonu, yem listesi,
-# fiyat senkronu ve RAG araması çalışır; yalnızca /api/v1/agent/query 503 döner.
+# LLM anahtarı (NVIDIA_API_KEY ya da GROQ_API_KEY) opsiyoneldir. Anahtarsız da arayüz, rasyon
+# optimizasyonu, yem listesi, fiyat senkronu ve RAG araması çalışır; yalnızca sohbet 503 döner.
 
 services:
   db:
@@ -27,8 +27,12 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-rationai}:${POSTGRES_PASSWORD:-rationai}@db:5432/${POSTGRES_DB:-rationai}
       # Boş bırakılabilir: sohbet kapanır, gerisi çalışır.
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
       GROQ_MODEL: ${GROQ_MODEL:-}
+      PRICE_AUTO_SYNC: ${PRICE_AUTO_SYNC:-1}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       db:
