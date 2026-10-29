@@ -141,13 +141,29 @@ MAX_INCLUSION_BY_TYPE = {
     "hay": 0.30,
     "straw": 0.08,
     "grain": 0.30,       # asidoz koruması
-    "protein": 0.25,
+    "protein": 0.25,     # ATK ve SFK en fazla %25 (kullanıcı notu)
     "byproduct": 0.20,
-    "fat": 0.04,         # korunmuş yağ; rasyon toplam yağı %6-7'yi aşmamalı
+    "fat": 0.06,         # eklenen yağ; ayrıca toplamı `fat_added_max` ile sınırlı
+    "npn": 0.01,         # üre vb.; ayrıca toplamı NPN_UREA_EQ_MAX ile sınırlı
     "mineral": 0.015,
     "salt": 0.005,
     "unknown": 0.20,
 }
+
+# Tek tek yem tavanı, yem tipinin tavanının yerine geçer (kullanıcı notları):
+# arpa en fazla %40 (asidoz), buğday en fazla %10 (glüten, hızlı fermantasyon).
+# Kuru dönemde tahıl tavanı zaten düşük olduğu için orada yalnızca buğday kalır.
+MAX_INCLUSION_BY_FEED_LACTATING = {"Arpa": 0.40, "Buğday": 0.10}
+
+# Protein olmayan azot (üre, amonyum sülfat, ürik asit) toplamı, üre eşdeğeri olarak
+# rasyon KM'sinin en fazla %1'i. Üre eşdeğeri = yemin HP'si / ürenin HP'si (%292).
+NPN_UREA_EQ_MAX = 0.01
+UREA_CP_PCT = 292.0
+
+# Kuru dönemde verilmeyenler: yonca (yüksek K ve Ca, süt humması) ve mermer tozu
+# ("kuru dönem yeminde Ca olmaz"). Seçilmiş olsalar bile rasyondan çıkarılır.
+DRY_EXCLUDED_FEEDS = frozenset({"Yonca Kuru Otu", "Yonca Silajı", "Mermer Tozu"})
+DRY_EXCLUDED_REASON = "yonca: yüksek K ve Ca; kuru dönemde kalsiyum eklenmez — süt humması"
 
 # Silaj seçilmediyse kaba yemin tabanı kuru ottur; pencereler genişler.
 # Bu uyarlama olmadan silajsız (kuru) rasyon %45 kaba yem oranına ulaşamayıp
@@ -170,6 +186,28 @@ class RationRules:
     hay_agg_max_with_silage: Optional[float]
     starch_max: float               # % KM — asidoz
     fat_max: float                  # ham yağ % KM — rumen fermantasyonu
+    fat_added_max: float            # eklenen yağ (fat tipi yemler) toplamı, KM payı
+    ca_p_ratio_min: float
+    ca_p_ratio_max: float
+    max_inclusion_by_feed: Dict[str, float] = field(default_factory=dict)
+    excluded_feeds: frozenset = frozenset()
+    excluded_reason: str = ""
+    # Yeme özel çıkarma gerekçesi; yoksa `excluded_reason` kullanılır.
+    excluded_reason_by_feed: Dict[str, str] = field(default_factory=dict)
+    # Doğuma yakın dönemde günlük Ca/P tavanı (g/gün) — süt humması; None = yok.
+    ca_max_g_day: Optional[float] = None
+    p_max_g_day: Optional[float] = None
+    # HP < %12 cezası; besi sığırında ağır ve yavaş büyüyen hayvanın ihtiyacı bunun altında.
+    protein_guardrail: bool = True
+    # Dane : küspe en az bu oran (besi, kullanıcı notu 6:1); None = kural yok.
+    grain_to_meal_min: Optional[float] = None
+    # Kesif yem kısmının (kaba yem ve mineral dışı) en az HP'si, DOĞAL halde % — kuzu
+    # besisinde kullanıcı notu "kesif yem en az %16-17 HP". None = kural yok.
+    concentrate_cp_min_asfed: Optional[float] = None
+    # Seçiliyse yemin rasyondaki en az KM payı (kuzuda amonyum klorür %0.5).
+    min_inclusion_by_feed: Dict[str, float] = field(default_factory=dict)
+    # Sığır için konmuş as-fed sağlık sınırı bu grupta uygulanmaz (koyun yoncayı iyi kullanır).
+    health_cap_exempt: frozenset = frozenset()
 
 
 # ⚠️ Kuru inek sağmal kurallarına zorlanırsa (NDF ≤ %35, saman ≤ %8) enerji yoğun,
@@ -182,8 +220,12 @@ RULES_BY_GROUP = {
         ndf_min=28.0, ndf_max=35.0, forage_ndf_min=19.0,
         forage_ratio_min=0.45, forage_ratio_max=0.65,
         silage_base_min=0.25, hay_agg_max_with_silage=0.40,
-        starch_max=28.0, fat_max=7.0,
+        starch_max=28.0, fat_max=7.0, fat_added_max=0.06,
+        ca_p_ratio_min=1.5, ca_p_ratio_max=2.5,
+        max_inclusion_by_feed=MAX_INCLUSION_BY_FEED_LACTATING,
     ),
+    # Kuru dönem: kalsiyum eklenmez ama oran ters çevrilmez — P, Ca'yı geçmez (Ca:P ≥ 1).
+    # Günde 80 g üstü P D vitamini üretimini baskılayıp süt hummasını tetikler (Horst & Goff).
     "dry_faroff": RationRules(
         label="Kuru (erken)",
         max_inclusion={**MAX_INCLUSION_BY_TYPE, "silage": 0.40, "hay": 0.60, "straw": 0.35,
@@ -192,8 +234,13 @@ RULES_BY_GROUP = {
         ndf_min=40.0, ndf_max=55.0, forage_ndf_min=30.0,
         forage_ratio_min=0.70, forage_ratio_max=0.90,
         silage_base_min=0.0, hay_agg_max_with_silage=None,
-        starch_max=18.0, fat_max=5.0,
+        starch_max=18.0, fat_max=5.0, fat_added_max=0.0,
+        ca_p_ratio_min=1.0, ca_p_ratio_max=2.5,
+        max_inclusion_by_feed={"Buğday": 0.10},
+        excluded_feeds=DRY_EXCLUDED_FEEDS,
+        excluded_reason=DRY_EXCLUDED_REASON,
     ),
+    # Doğuma son 2-3 hafta: Ca < 100 g, P < 45 g/gün (Manitoba Agriculture).
     "dry_closeup": RationRules(
         label="Kuru (doğuma yakın)",
         max_inclusion={**MAX_INCLUSION_BY_TYPE, "silage": 0.45, "hay": 0.50, "straw": 0.25,
@@ -202,7 +249,66 @@ RULES_BY_GROUP = {
         ndf_min=35.0, ndf_max=45.0, forage_ndf_min=25.0,
         forage_ratio_min=0.60, forage_ratio_max=0.80,
         silage_base_min=0.0, hay_agg_max_with_silage=None,
-        starch_max=22.0, fat_max=5.0,
+        starch_max=22.0, fat_max=5.0, fat_added_max=0.02,
+        ca_p_ratio_min=1.0, ca_p_ratio_max=2.5,
+        max_inclusion_by_feed={"Buğday": 0.10},
+        excluded_feeds=DRY_EXCLUDED_FEEDS,
+        excluded_reason=DRY_EXCLUDED_REASON,
+        ca_max_g_day=100.0, p_max_g_day=45.0,
+    ),
+    # Besi sığırı (data/notlar/rasyon_notlari.md §5). Kaba yem tabanı besi gününe göre
+    # requirements.rules_for() ile kademeli %50 → %30 iner. Nişasta ve NDF için kaynaklarda
+    # sayısal sınır yok; %30 kaba yem tabanı (ABD besisinde %8-15) asidozu tutar.
+    # Toplam yağ ≤ %6.5 KM ve Ca:P 1.5-2 (idrar taşı) Merck Veterinary Manual / NASEM 2016.
+    "beef": RationRules(
+        label="Besi sığırı",
+        max_inclusion={**MAX_INCLUSION_BY_TYPE, "silage": 0.50, "hay": 0.40, "straw": 0.30,
+                       "grain": 0.40, "byproduct": 0.25},
+        max_inclusion_no_silage={},
+        ndf_min=0.0, ndf_max=100.0, forage_ndf_min=0.0,
+        forage_ratio_min=0.30, forage_ratio_max=0.60,
+        silage_base_min=0.0, hay_agg_max_with_silage=None,
+        starch_max=100.0, fat_max=6.5, fat_added_max=0.06,
+        ca_p_ratio_min=1.5, ca_p_ratio_max=2.0,
+        max_inclusion_by_feed=MAX_INCLUSION_BY_FEED_LACTATING,
+        excluded_feeds=frozenset({"Soya Küspesi 46", "Soya Küspesi 48", "Soya Küspesi 52"}),
+        excluded_reason="besi rasyonunda soya küspesi kullanılmaz",
+        protein_guardrail=False,
+        grain_to_meal_min=6.0,
+    ),
+    # Kuzu / toklu besisi (rasyon_notlari.md §6). Kaba yem tabanı sığırdaki gibi kademeli
+    # %50 → %30 (requirements.rules_for). Koyuna özgü:
+    # - Bakır: koyun bakıra çok hassastır (karaciğerde birikir, hemolitik kriz); sığır
+    #   premiksi çıkarılır, bakırsız koyun premiksi kullanılır.
+    # - İdrar taşı (erkek kuzu): Ca:P en az 2 (Merck: 2:1-2.5:1), amonyum klorür %0.5 KM.
+    # - Üre ve diğer NPN kuzu besisinde verilmez (kullanıcı kararı, temkinli seçim).
+    # - Dane:küspe 6:1 yok: kesif yemin %16 HP tabanıyla çelişir.
+    "lamb": RationRules(
+        label="Küçükbaş besisi",
+        max_inclusion={**MAX_INCLUSION_BY_TYPE, "silage": 0.40, "hay": 0.50, "straw": 0.15,
+                       "grain": 0.40, "byproduct": 0.25},
+        max_inclusion_no_silage={},
+        ndf_min=0.0, ndf_max=100.0, forage_ndf_min=0.0,
+        forage_ratio_min=0.30, forage_ratio_max=0.60,
+        silage_base_min=0.0, hay_agg_max_with_silage=None,
+        starch_max=100.0, fat_max=6.0, fat_added_max=0.06,
+        ca_p_ratio_min=2.0, ca_p_ratio_max=2.5,
+        max_inclusion_by_feed={**MAX_INCLUSION_BY_FEED_LACTATING, "Amonyum Klorür": 0.005},
+        excluded_feeds=frozenset({
+            "Vitamin-Mineral Premiks", "Üre", "Amonyum Sülfat", "Ürik Asit",
+            "Soya Küspesi 46", "Soya Küspesi 48", "Soya Küspesi 52",
+        }),
+        excluded_reason="besi rasyonunda soya küspesi kullanılmaz",
+        excluded_reason_by_feed={
+            "Vitamin-Mineral Premiks": "sığır premiksindeki bakır koyunda zehirlidir — "
+                                       "bakırsız koyun premiksi kullanın",
+            **dict.fromkeys(("Üre", "Amonyum Sülfat", "Ürik Asit"),
+                            "kuzu besisinde üre ve diğer protein olmayan azot verilmez"),
+        },
+        protein_guardrail=False,
+        concentrate_cp_min_asfed=16.0,
+        min_inclusion_by_feed={"Amonyum Klorür": 0.005},
+        health_cap_exempt=frozenset({"Yonca Kuru Otu"}),
     ),
 }
 LACTATING_RULES = RULES_BY_GROUP["lactating"]
@@ -216,13 +322,13 @@ MIN_INCLUSION_BY_TYPE = {
     "protein": 0.03,
     "byproduct": 0.02,
     "fat": 0.0,
+    "npn": 0.0,
     "mineral": 0.001,
     "salt": 0.001,
     "unknown": 0.01,
 }
 
 NDF_INTAKE_PCT_BW = 1.2                        # kg NDF/gün <= %1.2 x canlı ağırlık
-CA_P_RATIO_MIN, CA_P_RATIO_MAX = 1.5, 2.5
 MIN_DAILY_DM_INTAKE_KG = 12.0                  # hedef verilmezse önemsiz çözümleri engeller
 SALT_MIN_PCT_DM = 0.25                         # seçiliyse tuz en az bu kadar (% KM)
 
@@ -236,11 +342,13 @@ MCP_PER_RDP = 0.85
 MP_PER_MCP = 0.64
 RUP_DIGESTIBILITY = 0.80
 
-# Protein korumalı koridor: bu yemlerden biri seçiliyse HP < %12 KM ağır cezalandırılır.
+# Protein korumalı koridor: küspe/protein yemi ya da yonca seçiliyse HP < %12 KM ağır
+# cezalandırılır.
 PROTEIN_GUARDRAIL_PCT = 12.0
-PROTEIN_RICH_FEEDS = frozenset({
-    "Soya Küspesi", "Soya-Fullfat", "Ayçiçeği Küspesi", "Yonca Kuru Otu", "Yonca", "Yonca Silajı",
-})
+
+
+def _is_protein_rich(feed: "FeedIngredient") -> bool:
+    return feed.feed_type == "protein" or feed.name.startswith("Yonca")
 
 # Ceza çarpanları (soft_constraint_penalty'nin katları).
 PENALTY_MAX_INCLUSION = 5.0
@@ -259,6 +367,9 @@ NUTRIENTS = {
     "calcium": ("calcium", 1.0, "calcium_g_per_kg_dm", "g/kg KM", "Kalsiyum", 1),
     "phosphorus": ("phosphorus", 1.0, "phosphorus_g_per_kg_dm", "g/kg KM", "Fosfor", 1),
 }
+ENERGY_KEYS = frozenset({"metabolic_energy", "net_energy_lactation"})
+# Kullanıcı notu: fazladan alınan her 7000 kcal ME ≈ 1 kg canlı ağırlık artışı.
+ME_KCAL_PER_KG_GAIN = 7000.0
 DRY_MATTER_BOUND = ("dry_matter_percent", "%", "Kuru madde", 1)
 MP_BOUND = ("mp_g_per_kg_dm", "g/kg KM", "Metabolize protein", 0)
 
@@ -282,6 +393,11 @@ def _max_inclusion_windows(feeds: List[FeedIngredient], rules: RationRules) -> D
     if not any(f.feed_type == "silage" for f in feeds):
         windows.update(rules.max_inclusion_no_silage)
     return windows
+
+
+def _feed_cap(feed: FeedIngredient, windows: Dict[str, float], rules: RationRules) -> float:
+    """Tek bir yemin azami KM payı: yeme özel tavan varsa o, yoksa yem tipinin tavanı."""
+    return rules.max_inclusion_by_feed.get(feed.name, windows.get(feed.feed_type, 0.20))
 
 
 def feeds_from_db(db_feeds) -> List[FeedIngredient]:
@@ -375,12 +491,13 @@ def solve_ration_problem(
     x = {}
     health_caps: Dict[str, float] = {}
     for feed in feeds:
-        cap = feed.health_cap_kg(body_weight_kg)
+        cap = None if feed.name in rules.health_cap_exempt else feed.health_cap_kg(body_weight_kg)
         x[feed.name] = pulp.LpVariable(f"feed_{feed.name}", lowBound=0, upBound=cap)
         if cap is not None:
             health_caps[feed.name] = cap
     if health_caps:
-        detail = ", ".join(f"{name} ≤ {cap:.1f} kg" for name, cap in sorted(health_caps.items()))
+        detail = ", ".join(f"{name} ≤ {cap:.1f} kg" if cap >= 1 else f"{name} ≤ {cap * 1000:.0f} g"
+                           for name, cap in sorted(health_caps.items()))
         adjustments.append(f"🩺 Hayvan sağlığı sınırları (günlük doğal hali): {detail}")
 
     def dm_sum(subset, value=lambda f: 1.0):
@@ -393,11 +510,11 @@ def solve_ration_problem(
 
     # ---- Protein korumalı koridor (HP >= %12 KM, çok pahalı yumuşak) ----
     total_cp = dm_sum(feeds, lambda f: f.crude_protein / 100.0)
-    if any(f.name in PROTEIN_RICH_FEEDS for f in feeds):
+    if rules.protein_guardrail and any(_is_protein_rich(f) for f in feeds):
         slack = soft("protein_guardrail_slack", PENALTY_PROTEIN_GUARDRAIL)
         prob += total_cp >= PROTEIN_GUARDRAIL_PCT / 100.0 * total_dm - slack, "Protein_Guardrail_Min_12pct"
         adjustments.append(
-            f"🛡️ Protein korumalı koridor aktif: Soya/Ayçiçeği/Yonca yemleri mevcut -> "
+            f"🛡️ Protein korumalı koridor aktif: küspe veya yonca mevcut -> "
             f"CP <%12 KM cezalandırılır (ceza katsayısı: {PENALTY_PROTEIN_GUARDRAIL:.0f}x)."
         )
 
@@ -426,7 +543,7 @@ def solve_ration_problem(
         requested = min_inclusion_pct_dm / 100.0
         applied = {}
         for feed in feeds:
-            frac = min(requested, windows.get(feed.feed_type, 0.20) * 0.5, 0.80 / len(feeds))
+            frac = min(requested, _feed_cap(feed, windows, rules) * 0.5, 0.80 / len(feeds))
             if frac <= 0:
                 continue
             applied[feed.name] = frac
@@ -458,7 +575,7 @@ def solve_ration_problem(
             windowed.setdefault(feed.feed_type, []).append(feed.name)
 
         max_slack = 0 if hard_ration_rules else soft(f"max_incl_slack_{feed.name}", PENALTY_MAX_INCLUSION)
-        prob += (feed.dm_fraction() * x[feed.name] <= windows.get(feed.feed_type, 0.20) * total_dm + max_slack,
+        prob += (feed.dm_fraction() * x[feed.name] <= _feed_cap(feed, windows, rules) * total_dm + max_slack,
                  f"Max_Inclusion_{feed.name}")
 
     if windowed:
@@ -472,6 +589,10 @@ def solve_ration_problem(
             f"🔒 Yem sınıfı dahil pencereleri ({mode}; kullanılan yem en az alt sınır kadar "
             f"girer): {'; '.join(parts)}"
         )
+    feed_caps = [f"{f.name} ≤ %{rules.max_inclusion_by_feed[f.name] * 100:g}"
+                 for f in feeds if f.name in rules.max_inclusion_by_feed]
+    if feed_caps:
+        adjustments.append(f"🔒 Yeme özel tavanlar (KM payı): {', '.join(feed_caps)}")
 
     # ---- Besin hedefleri (HP, ME, Ca, P) ----
     # hard_nutrients=True iken slack yok -> hedefler GARANTİ edilir (model infeasible olabilir).
@@ -490,15 +611,21 @@ def solve_ration_problem(
             slack = 0 if hard_nutrients else soft(f"slack_{key}_min", 1.0)
             prob += total >= low / divisor * total_dm - slack, f"{key}_min"
         if high is not None:
-            slack = 0 if hard_nutrients else soft(f"slack_{key}_max", 1.0)
+            # Enerji tavanı katı modda da yumuşaktır: tablo değerleriyle düşük verimli ve kuru
+            # inekte yenebilir rasyonun enerjisi ihtiyacın altına inemiyor. Fazla en aza
+            # indirilir ve uyarı olarak raporlanır; rasyon bu yüzden gevşetilmiş moda düşmez.
+            soft_max = not hard_nutrients or key in ENERGY_KEYS
+            slack = soft(f"slack_{key}_max", 1.0) if soft_max else 0
             prob += total <= high / divisor * total_dm + slack, f"{key}_max"
 
     # Ca:P ORANI — Ca ve P tek tek hedefte olsa bile oran bozuk olabilir. Her zaman
     # yumuşak: sınırlı yem seçkisinde oranı katı tutmak modeli gereksiz yere çözümsüz bırakır.
     total_ca, total_p = nutrient_totals["calcium"], nutrient_totals["phosphorus"]
-    prob += total_ca >= CA_P_RATIO_MIN * total_p - soft("ca_p_ratio_low_slack", PENALTY_CA_P_RATIO), "CaP_Ratio_Min"
-    prob += total_ca <= CA_P_RATIO_MAX * total_p + soft("ca_p_ratio_high_slack", PENALTY_CA_P_RATIO), "CaP_Ratio_Max"
-    adjustments.append(f"⚖️ Ca:P oranı {CA_P_RATIO_MIN}-{CA_P_RATIO_MAX} aralığında tutulmaya çalışılıyor.")
+    prob += total_ca >= rules.ca_p_ratio_min * total_p - soft("ca_p_ratio_low_slack", PENALTY_CA_P_RATIO), "CaP_Ratio_Min"
+    prob += total_ca <= rules.ca_p_ratio_max * total_p + soft("ca_p_ratio_high_slack", PENALTY_CA_P_RATIO), "CaP_Ratio_Max"
+    adjustments.append(
+        f"⚖️ Ca:P oranı {rules.ca_p_ratio_min}-{rules.ca_p_ratio_max} aralığında tutulmaya çalışılıyor."
+    )
 
     # Kuru madde % (doğal hali) — her zaman yumuşak.
     if constraints.dry_matter_min is not None:
@@ -518,7 +645,7 @@ def solve_ration_problem(
 
     total_ndf = dm_sum(feeds, lambda f: f.ndf)
     has_ndf_data = any(f.ndf > 0 for f in feeds)
-    if has_ndf_data:
+    if has_ndf_data and rules.ndf_max < 100:   # besi grubunda NDF penceresi yok
         prob += total_ndf >= rules.ndf_min * total_dm - rule_slack("ndf_min"), "NDF_Min"
         prob += total_ndf <= rules.ndf_max * total_dm + rule_slack("ndf_max"), "NDF_Max"
         adjustments.append(
@@ -563,6 +690,10 @@ def solve_ration_problem(
             prob += (dm_sum(hay_feeds) <= rules.hay_agg_max_with_silage * total_dm + rule_slack("hay_agg"),
                      "Hay_Aggregate_Max")
     else:
+        # Kaba yemsiz rasyon kâğıt üzerinde NDF'yi kepek/posa ile tutturabiliyor ve "tüm
+        # hedefler sağlandı" diye dönüyordu. Kural seçimden bağımsız: katı modda çözümsüz,
+        # yumuşak modda cezalı — teşhis kullanıcıya kaba yem eklemesini söyler.
+        prob += (0 >= rules.forage_ratio_min * total_dm - rule_slack("forage_min"), "Min_Forage_Ratio")
         adjustments.append("⚠️ UYARI: Rasyonda hiç kaba yem yok! Rumen sağlığı için silaj/kuru ot ekleyin.")
 
     # Tuzun modelde besin karşılığı yok (Na izlenmiyor): kural olmasa en ucuz rasyon
@@ -573,12 +704,63 @@ def solve_ration_problem(
                  "Salt_Min")
         adjustments.append(f"🧂 Tuz en az %{SALT_MIN_PCT_DM} KM.")
 
+    meal_feeds = [f for f in feeds if "Küspesi" in f.name]
+    if rules.grain_to_meal_min and meal_feeds:
+        grain_feeds = [f for f in feeds if f.feed_type == "grain"]
+        prob += (dm_sum(grain_feeds) >= rules.grain_to_meal_min * dm_sum(meal_feeds)
+                 - rule_slack("grain_to_meal"), "Grain_To_Meal")
+        adjustments.append(f"🌾 Dane : küspe en az {rules.grain_to_meal_min:g} : 1.")
+
+    # Kesif yemin HP'si doğal halde: x doğal hali kg, HP kg = x · KM · HP(KM) / 100.
+    concentrate_feeds = [f for f in feeds if not f.is_forage() and f.feed_type not in ("mineral", "salt")]
+    if rules.concentrate_cp_min_asfed and concentrate_feeds:
+        prob += (dm_sum(concentrate_feeds, lambda f: f.crude_protein / 100.0)
+                 >= rules.concentrate_cp_min_asfed / 100.0
+                 * pulp.lpSum(x[f.name] for f in concentrate_feeds)
+                 - rule_slack("concentrate_cp"), "Concentrate_CP_Min")
+        adjustments.append(
+            f"🥜 Kesif yem kısmı en az %{rules.concentrate_cp_min_asfed:g} HP (doğal hal)."
+        )
+
+    for feed in feeds:
+        share = rules.min_inclusion_by_feed.get(feed.name)
+        if share:
+            prob += (dm_sum([feed]) >= share * total_dm - rule_slack(f"feed_min_{feed.name}"),
+                     f"Feed_Min_{feed.name}")
+            adjustments.append(f"💧 {feed.name} en az %{share * 100:g} KM.")
+
+    fat_feeds = [f for f in feeds if f.feed_type == "fat"]
+    if fat_feeds:
+        prob += (dm_sum(fat_feeds) <= rules.fat_added_max * total_dm + rule_slack("fat_added"),
+                 "Added_Fat_Max")
+        adjustments.append(f"🧈 Eklenen yağ toplamı en fazla %{rules.fat_added_max * 100:.0f} KM.")
+
+    # Protein olmayan azot: zehirlenme sınırı ayrıca değişken üst sınırı (sağlık sınırı).
+    npn_feeds = [f for f in feeds if f.feed_type == "npn"]
+    if npn_feeds:
+        urea_eq = dm_sum(npn_feeds, lambda f: f.crude_protein / UREA_CP_PCT)
+        prob += urea_eq <= NPN_UREA_EQ_MAX * total_dm + rule_slack("npn_max"), "NPN_Urea_Eq_Max"
+        adjustments.append(
+            f"⚗️ Protein olmayan azot (üre eşdeğeri) en fazla %{NPN_UREA_EQ_MAX * 100:.0f} KM."
+        )
+
+    # Doğuma yakın dönemde süt humması: günlük Ca ve P tavanı (Ca g/kg KM × kg KM = g/gün).
+    if rules.ca_max_g_day is not None:
+        prob += total_ca <= rules.ca_max_g_day + rule_slack("ca_day_max"), "Ca_Daily_Max"
+    if rules.p_max_g_day is not None:
+        prob += total_p <= rules.p_max_g_day + rule_slack("p_day_max"), "P_Daily_Max"
+    if rules.ca_max_g_day is not None or rules.p_max_g_day is not None:
+        adjustments.append(
+            f"🍼 Süt humması önlemi: günde en fazla {rules.ca_max_g_day:.0f} g Ca ve "
+            f"{rules.p_max_g_day:.0f} g P."
+        )
+
     # ============================================================
     # RUMEN SAĞLIĞI: nişasta, yağ, RDP dengesi
     # NDF lifin yeterli olduğunu söyler ama asidozu yakalamaz: %31 nişastalı bir
     # rasyon NDF penceresine rahatça sığıyordu.
     # ============================================================
-    if any(f.starch > 0 for f in feeds):
+    if rules.starch_max < 100 and any(f.starch > 0 for f in feeds):
         prob += (dm_sum(feeds, lambda f: f.starch) <= rules.starch_max * total_dm + rule_slack("starch_max"),
                  "Starch_Max")
         adjustments.append(f"🌾 Nişasta en fazla %{rules.starch_max:.0f} KM (asidoz).")
@@ -589,7 +771,9 @@ def solve_ration_problem(
     total_tdn = dm_sum(feeds, lambda f: f.tdn_pct() / 100.0)   # kg TSBM/gün
     total_rdp = dm_sum(feeds, lambda f: f.rdp_pct_dm() / 100.0)
     total_rup = dm_sum(feeds, lambda f: f.rup_pct_dm() / 100.0)
-    if any(f.rup > 0 for f in feeds):
+    # RDP dengesi MP sisteminin parçasıdır; hayvan profilinden gelen hedefler HP sistemiyle
+    # kurulduğu için yalnızca MP hedefi açıkça istendiğinde uygulanır.
+    if constraints.metabolizable_protein_min is not None and any(f.rup > 0 for f in feeds):
         prob += (total_rdp >= MCP_PER_TDN / MCP_PER_RDP * total_tdn - rule_slack("rdp_balance"),
                  "RDP_Balance")
         adjustments.append("🦠 RDP dengesi: rumen mikropları enerjiye yetecek yıkılabilir protein alıyor.")
@@ -712,6 +896,17 @@ def solve_ration_problem(
                     f"{'ALTINDA' if below else 'USTUNDE'} ({value:.4f} {'<' if below else '>'} "
                     f"{target:.4f} {unit}, fark: {diff:.4f})"
                 )
+                if above and key == "metabolic_energy":
+                    # Gevşetme değil, kaçınılmaz enerji fazlası: ihtiyacın (alt sınır) üstü.
+                    need = constraints.metabolic_energy_min or target
+                    surplus_kcal = (value - need) * actual_dm * 1000
+                    warnings.append(
+                        f"Enerji fazlası: günde ~{surplus_kcal:,.0f} kcal ME ihtiyacın üstünde → "
+                        f"~{surplus_kcal / ME_KCAL_PER_KG_GAIN:.1f} kg/gün canlı ağırlık artışı "
+                        "(7000 kcal ≈ 1 kg). Seçilen yemlerle rasyon daha düşük enerjili olamıyor; "
+                        "BCS'yi izleyin."
+                    )
+                    continue
                 violations.append(f"{name}: {constraints_status[name]}")
                 adjustments.append(
                     f"⚠️ {label} {'minimumu' if below else 'maksimumu'} ({target:.{digits}f} {unit}) "
@@ -786,6 +981,47 @@ def optimize_ration(
     if max_daily_intake_kg is None:
         max_daily_intake_kg = expected_daily_intake_kg / 0.35  # en az %35 KM varsayımı
 
+    # Grupta verilmeyen yemler (kuru dönemde yonca, mermer tozu) seçilmiş olsa da çıkarılır;
+    # modelde kalsalar zorunlu dahil cezası rasyonu boşuna gevşetilmiş moda iterdi.
+    excluded = [f.name for f in feeds if f.name in rules.excluded_feeds]
+    feeds = [f for f in feeds if f.name not in rules.excluded_feeds]
+    if not feeds:
+        return _empty_result(
+            "Yem bileşeni yok", feeds,
+            adjustments=[f"⛔ Seçilen yemlerin hepsi {rules.label} grubunda verilmiyor: "
+                         f"{', '.join(excluded)}."],
+        )
+    result = _optimize_two_phase(
+        feeds, constraints, use_all_selected=use_all_selected,
+        min_inclusion_pct_dm=min_inclusion_pct_dm,
+        expected_daily_intake_kg=expected_daily_intake_kg,
+        max_daily_intake_kg=max_daily_intake_kg, body_weight_kg=body_weight_kg,
+        soft_constraint_penalty=soft_constraint_penalty, rules=rules,
+    )
+    if excluded:
+        reasons = "; ".join(dict.fromkeys(
+            rules.excluded_reason_by_feed.get(name, rules.excluded_reason) for name in excluded))
+        result.adjustments.insert(0, (
+            f"🚫 {rules.label} grubunda verilmez, rasyondan çıkarıldı: {', '.join(excluded)} "
+            f"({reasons})."
+        ))
+        result.solver_details["excluded_feeds"] = excluded
+        result.solver_details["excluded_reason"] = reasons
+    return result
+
+
+def _optimize_two_phase(
+    feeds: List[FeedIngredient],
+    constraints: NutrientConstraints,
+    *,
+    use_all_selected: bool,
+    min_inclusion_pct_dm: float,
+    expected_daily_intake_kg: float,
+    max_daily_intake_kg: float,
+    body_weight_kg: Optional[float],
+    soft_constraint_penalty: float,
+    rules: RationRules,
+) -> OptimizationResult:
     common = dict(
         feeds=feeds,
         constraints=constraints,
@@ -803,10 +1039,13 @@ def optimize_ration(
     if result.status == "Optimal (tum hedefler saglandi)":
         result.solver_details["nutrition_mode"] = "hard"
         result.solver_details["ration_rules_mode"] = "hard"
+        surplus = result.constraints_status.get("metabolic_energy_max", "OK") != "OK"
+        result.solver_details["energy_surplus"] = surplus
         result.adjustments.insert(
             0,
-            "✅ Tüm besin hedefleri ve rasyon kuralları tam olarak sağlandı. Bu, "
-            "hedefleri karşılayan rasyonlar arasındaki EN UCUZ olanıdır."
+            "✅ Tüm besin ihtiyaçları ve rasyon kuralları sağlandı"
+            + (" — enerji ihtiyacın üstünde kaldı, uyarıya bakın. " if surplus else ". ")
+            + "Bu, hedefleri karşılayan rasyonlar arasındaki EN UCUZ olanıdır."
         )
         _annotate_dropped_feeds(result, feeds, use_all_selected)
         return result
@@ -967,13 +1206,10 @@ def format_result_for_agent(result: OptimizationResult) -> str:
         "",
         "RASYON BESİN DEĞERİ (KM bazında):",
         f"  - Ham protein: {content.get('crude_protein_percent_dm', 0):.2f}% KM",
-        f"  - Net enerji (NEL): {content.get('net_energy_lactation_mcal_per_kg_dm', 0):.3f} Mcal/kg KM",
-        f"  - Met. enerji: {content.get('metabolic_energy_mcal_per_kg_dm', 0):.3f} Mcal/kg KM",
+        f"  - Metabolik enerji: {content.get('metabolic_energy_mcal_per_kg_dm', 0) * 1000:.0f} kcal/kg KM",
         f"  - Kalsiyum: {content.get('calcium_g_per_kg_dm', 0):.2f} g/kg KM",
         f"  - Fosfor: {content.get('phosphorus_g_per_kg_dm', 0):.2f} g/kg KM",
         f"  - Kuru madde: {content.get('dry_matter_percent', 0):.1f}% (doğal hali)",
-        f"  - Metabolize protein: {result.daily_nutrient_intake.get('mp_g', 0):.0f} g/gün "
-        f"(RDP %{content.get('rdp_percent_dm', 0):.1f}, RUP %{content.get('rup_percent_dm', 0):.1f} KM)",
         f"  - Nişasta: %{content.get('starch_percent_dm', 0):.1f} KM · "
         f"ham yağ: %{content.get('ether_extract_percent_dm', 0):.1f} KM",
     ]
