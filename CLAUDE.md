@@ -67,7 +67,7 @@ rationai/
 ├── frontend/
 │   ├── Dockerfile             # python:3.14-slim; streamlit only, no chromadb/langchain
 │   ├── app.py                 # Streamlit UI — 3 pages in a top menu + "Asistan" chat dialog
-│   └── assets/                # logo.svg / icon.svg for st.logo
+│   └── assets/                # logo.svg / icon.svg for st.logo; screenshots/ = README images (docker-ignored)
 ├── .streamlit/
 │   └── config.toml            # Theme: green light + dark modes, Inter font, radii; no CSS anywhere
 ├── rationai.db                # Local SQLite database (default `DATABASE_URL`)
