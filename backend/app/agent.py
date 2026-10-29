@@ -26,14 +26,23 @@ from .optimization import (
     optimize_ration,
 )
 from .rag import query_documents
-from .requirements import AnimalProfile, compute_requirements, requirements_to_constraints
+from .requirements import (
+    AnimalProfile,
+    GROWTH_GROUPS,
+    annotate_growth_result,
+    compute_requirements,
+    requirements_to_constraints,
+    rules_for,
+)
 from .schemas import AgentResponse
 
 logger = logging.getLogger(__name__)
 
 # Minerals the UI pre-selects; added when the LLM names no mineral, otherwise Ca/P
 # can only come from forages and the ration lands in relaxed mode.
-DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz")
+DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz", "Vitamin-Mineral Premiks")
+# Kuzu: sığır premiksi yok (bakır), DCP yok (Ca:P ≥ 2), amonyum klorür var (idrar taşı).
+DEFAULT_LAMB_MINERALS = ("Mermer Tozu", "Tuz", "Koyun Premiksi (Bakırsız)", "Amonyum Klorür")
 
 # Short or English names the LLM sometimes uses -> database name. The short Turkish
 # names matter: substring matching sent "yonca" to whichever alfalfa feed came first
@@ -41,10 +50,20 @@ DEFAULT_MINERALS = ("Mermer Tozu", "DCP (Dikalsiyum Fosfat)", "Tuz")
 _FEED_ALIASES = {
     "yonca": "Yonca Kuru Otu",
     "kuru yonca": "Yonca Kuru Otu",
-    "soya": "Soya Küspesi",
+    "soya": "Soya Küspesi 46",
+    "soya küspesi": "Soya Küspesi 46",
+    "sfk": "Soya Küspesi 46",
     "saman": "Buğday Samanı",
     "silaj": "Mısır Silajı",
-    "ayçiçeği": "Ayçiçeği Küspesi",
+    "ayçiçeği": "Ayçiçeği Küspesi 36",
+    "ayçiçeği küspesi": "Ayçiçeği Küspesi 36",
+    "atk": "Ayçiçeği Küspesi 36",
+    "pamuk küspesi": "Pamuk Tohumu Küspesi 24",
+    "ptk": "Pamuk Tohumu Küspesi 24",
+    "kolza": "Kanola Küspesi",
+    "kanola": "Kanola Küspesi",
+    "çayır otu": "Çayır Kuru Otu",
+    "bira posası": "Malt Posası (Yaş)",
     "kepek": "Buğday Kepeği",
     "pancar posası": "Şeker Pancarı Posası",
     "ddgs": "Mısır DDGS",
@@ -55,21 +74,21 @@ _FEED_ALIASES = {
     "wheat": "Buğday",
     "barley": "Arpa",
     "oats": "Yulaf",
-    "soybean meal": "Soya Küspesi",
-    "full-fat soybean": "Soya-Fullfat",
+    "soybean meal": "Soya Küspesi 46",
+    "full-fat soybean": "Soya Dane (Fullfat)",
     "corn gluten feed": "Mısır Gluten Yemi",
     "corn bran": "Mısır Kepeği",
     "wheat bran": "Buğday Kepeği",
     "alfalfa hay": "Yonca Kuru Otu",
     "corn silage": "Mısır Silajı",
-    "meadow hay": "Çayır Otu",
+    "meadow hay": "Çayır Kuru Otu",
     "straw": "Buğday Samanı",
 }
 
 # Physically sensible ranges for LLM-supplied constraints (DM basis).
 NUTRIENT_BOUNDS = {
     "crude_protein": (6.0, 30.0),           # % DM
-    "metabolizable_energy": (1.5, 3.5),     # Mcal/kg DM
+    "metabolizable_energy": (1.5, 4.0),     # Mcal/kg DM
     "net_energy_lactation": (0.9, 2.0),     # Mcal/kg DM
     "calcium": (1.0, 15.0),                 # g/kg DM
     "phosphorus": (1.0, 10.0),              # g/kg DM
@@ -164,9 +183,8 @@ def get_feed_data() -> ToolResult:
         return "Veritabanında yem verisi yok.", None
     lines = ["Mevcut yemler (besin değerleri KM bazında):"] + [
         f"- {f.name} [{f.feed_type}]: {f.price_per_kg} TL/kg, KM %{f.dry_matter}, "
-        f"HP %{f.crude_protein} (RUP %{f.rup or 0:.0f}'i), NEL {f.net_energy_lactation} Mcal/kg, "
-        f"nişasta %{f.starch or 0:.0f}, yağ %{f.ether_extract or 0:.1f}, "
-        f"ME {f.metabolic_energy} Mcal/kg, NDF %{f.ndf}, "
+        f"HP %{f.crude_protein}, ME {f.metabolic_energy * 1000:.0f} kcal/kg, "
+        f"nişasta %{f.starch or 0:.0f}, yağ %{f.ether_extract or 0:.1f}, NDF %{f.ndf}, "
         f"Ca {f.calcium} g/kg, P {f.phosphorus} g/kg"
         for f in feeds
     ]
@@ -185,14 +203,18 @@ def calculate_ration(
     first_lactation: bool = False,
     force_use_all_feeds: bool = True,
     min_inclusion_pct_dm: float = 3.0,
+    daily_gain: Optional[float] = None,
+    days_on_feed: int = 60,
 ) -> ToolResult:
     """Run the same two-phase optimizer the /optimize endpoint uses.
 
-    Targets come from the NASEM 2021 requirements of the described animal; `constraints`
+    Targets come from the ME + CP requirements of the described animal; `constraints`
     only overrides the keys the user stated explicitly. With no (matching) feed names,
     every feed is a candidate and none is forced in.
     """
     group = group if group in RULES_BY_GROUP else "lactating"
+    if daily_gain is None:
+        daily_gain = 0.3 if group == "lamb" else 1.4
     profile = AnimalProfile(
         group=group,
         body_weight_kg=float(animal_weight),
@@ -201,6 +223,8 @@ def calculate_ration(
         days_in_milk=max(1, int(days_in_milk)),
         multiparous=not bool(first_lactation),
         days_pregnant=max(0, int(days_pregnant)),
+        daily_gain_kg=min(max(float(daily_gain), 0.0), 2.5),
+        days_on_feed=max(1, int(days_on_feed)),
     )
     req = compute_requirements(profile)
     explicit = parse_constraints(constraints)
@@ -216,13 +240,14 @@ def calculate_ration(
         if names:
             selected = [f for f in all_feeds if f.name in names]
             if not any(f.feed_type in ("mineral", "salt") for f in selected):
-                selected += [f for f in all_feeds if f.name in DEFAULT_MINERALS]
+                defaults = DEFAULT_LAMB_MINERALS if group == "lamb" else DEFAULT_MINERALS
+                selected += [f for f in all_feeds if f.name in defaults]
         else:
             logger.info("Yem eşleşmesi yok (%s), tüm yemler aday", requested)
             selected, force_use_all_feeds = all_feeds, False
         feed_inputs = feeds_from_db(selected)
 
-    rules = RULES_BY_GROUP[group]
+    rules = rules_for(profile)
     result = optimize_ration(
         feed_inputs,
         target,
@@ -234,12 +259,16 @@ def calculate_ration(
         rules=rules,
     )
     result.adjustments = [
-        f"🐄 {rules.label}, {profile.body_weight_kg:.0f} kg"
+        f"{'🐑' if group == 'lamb' else '🐄'} {rules.label}, {profile.body_weight_kg:.0f} kg"
         + (f", {profile.milk_kg:.0f} kg süt, laktasyonun {profile.days_in_milk}. günü"
            if group == "lactating" else "")
-        + f": KMT {req.dm_intake_kg} kg, NEL {req.nel_min}-{req.nel_max} Mcal/kg KM, "
-          f"MP {req.mp_g_day:.0f} g/gün (NASEM 2021)."
+        + (f", hedef {profile.daily_gain_kg:g} kg/gün artış, besinin {profile.days_on_feed}. günü"
+           if group in GROWTH_GROUPS else "")
+        + f": KMT {req.dm_intake_kg} kg, ME {req.me_mcal_day * 1000:,.0f} kcal/gün "
+          f"({req.me_min * 1000:.0f} kcal/kg KM), HP {req.cp_g_day:.0f} g/gün (%{req.cp_min} KM)."
     ] + [f"ℹ️ {note}" for note in req.notes] + result.adjustments
+    if group in GROWTH_GROUPS:
+        annotate_growth_result(result, profile)
     structured = optimization_result_to_schema(result, feed_inputs).model_dump()
     return format_result_for_agent(result), structured
 
@@ -307,20 +336,24 @@ You can call one of these tools:
        Minerals are added automatically when none is listed.
        Map the user's words literally — never swap a feed for a "similar" one:
        plain "yonca" (alfalfa) = "Yonca Kuru Otu"; use a silage name ONLY when the user
-       says "silaj"/"silage" (plain "silaj" = "Mısır Silajı"); "soya" = "Soya Küspesi";
+       says "silaj"/"silage" (plain "silaj" = "Mısır Silajı"); "soya" = "Soya Küspesi 46";
+       "ayçiçeği"/"ATK" = "Ayçiçeği Küspesi 36" unless the user names the 24 grade;
        "saman" = "Buğday Samanı"; "kepek" = "Buğday Kepeği".
-     - Describe the ANIMAL; the tool computes the nutrient targets itself (NASEM 2021).
+     - Describe the ANIMAL; the tool computes the nutrient targets itself (ME + crude protein).
        Do NOT invent nutrient targets.
        - animal_weight (number, kg, default 650)
        - milk_yield (number, kg milk/day, default 30; a "litre" is ~1 kg)
-       - group: "lactating" (default), "dry_faroff" (dry, >3 weeks before calving)
-         or "dry_closeup" (last ~3 weeks before calving)
+       - group: "lactating" (default), "dry_faroff" (dry, >3 weeks before calving),
+         "dry_closeup" (last ~3 weeks before calving), "beef" (fattening cattle / besi) or
+         "lamb" (lamb / toklu fattening / kuzu besisi — pass the lamb's weight, e.g. 30)
+       - for "beef" and "lamb": daily_gain (kg/day, default 1.4 beef / 0.3 lamb),
+         days_on_feed (int, default 60)
        - days_in_milk (int, default 120), fat_pct (default 3.8),
          days_pregnant (int, 0 = not pregnant), first_lactation (bool, default false)
      - constraints (JSON object) — ONLY targets the user stated explicitly; they override
        the computed ones. DM basis, every key optional:
          "crude_protein": {{"min": 16, "max": 18}}          % DM
-         "net_energy_lactation": {{"min": 1.6, "max": 1.8}} Mcal NEL/kg DM
+         "metabolizable_energy": {{"min": 2.6, "max": 2.9}} Mcal ME/kg DM (2600 kcal = 2.6)
          "calcium": {{"min": 6, "max": 10}}                  g/kg DM = % x 10
          "phosphorus": {{"min": 3.5, "max": 5}}              g/kg DM = % x 10
          "daily_intake_kg": 22                             kg DM/day

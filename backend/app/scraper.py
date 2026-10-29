@@ -24,6 +24,17 @@ Kaynak 2: https://www.samsuntb.org.tr/urunler/ — her ürünün kendi "son işl
 (TARİH | EN AZ | EN ÇOK | ORTALAMA | MAHSÜL YILI | SATIŞ ŞEKLİ), yıllara uzanan geçmişle.
 Buğday kepeği, buğday samanı, ayçiçeği ve soya küspesi burada işlem görüyor.
 
+Besi ekonomisi yalnız KESİM (karkas) fiyatı kullanır: besici eti kesimhaneye satar, hayvan da
+(besilik dahil) kesim fiyatından değerlenir — canlı hayvan fiyatı kullanılmaz (kullanıcı).
+Yedek kaynak TOBB (`scrape_livestock`): bazı borsalar karkas ("DANA ETİ KARKAS", "KUZU ETİ
+KARKAS") işliyor — Ekim 2026'da Ankara, Gaziantep, Nazilli. Borsa listesi her seferinde
+`fiyat_borsa0.php`'den okunur.
+
+Karkas (kesim) fiyatının asıl kaynağı UKON'dur (`scrape_ukon`): Ulusal Kırmızı Et Konseyi her
+hafta kombina ve kesimhanelerden yağsız dana ve kuzu kesim fiyatlarını 7 bölge + Türkiye
+ortalaması olarak yayımlar. Türkiye'de hayvan bu kesim fiyatı üzerinden değerlenir (alış da);
+TOBB'daki karkas satırları yalnız UKON okunamazsa kullanılır.
+
 Yine de 37 yemin ~8'i canlı çekilebilir, kalanı `database._CURATED_FEEDS` taban fiyatında
 kalır. Hangi fiyatın canlı hangisinin taban olduğu `Feed.price_source` alanında tutulur ve
 arayüzde gösterilir — sessizce "canlı" numarası yapılmaz.
@@ -49,7 +60,7 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
 from sqlalchemy.orm import Session
 
-from .models import Feed
+from .models import Feed, MarketPrice
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +95,26 @@ TOBB_PRODUCT_PREFIX = {
     "YULAF": "Yulaf",
     "TRİTİKALE": "Tritikale",
     "NOHUT": "Nohut",
+    "ÇAVDAR": "Çavdar",
+    "SORGUM": "Sorgum",   # Ekim 2026'da borsada güncel işlem yoktu; çıkarsa yakalanır
 }
+
+# Karkas (UKON yedeği): TOBB ürün adı (TAM eşleşme) -> MarketPrice anahtarı. Tam eşleşme
+# kasıtlı: "DANA ETİ BUT" ve "KUZU ETİ PİRZOLA" parça et.
+TOBB_INDEX_URL = "https://borsa.tobb.org.tr/fiyat_borsa0.php"
+LIVESTOCK_PRODUCTS = {
+    "DANA ETİ KARKAS": "dana_karkas",
+    "KUZU ETİ KARKAS": "kuzu_karkas",
+}
+# UKON haftalık kesim fiyatları: sütun -> karkas anahtarı. Bölge satırları "<anahtar>@<bölge>"
+# olarak saklanır; "Ortalama" satırı anahtarın kendisidir (Türkiye ortalaması).
+UKON_URL = "https://www.ukon.org.tr/fiyatlar"
+UKON_COLUMNS = {"DANA": "dana_karkas", "KUZU": "kuzu_karkas"}
+# UKON haftalık yayımlar; bundan eski tablo kullanılmaz.
+UKON_MAX_AGE_DAYS = 21
+
+# İndeks okunamazsa: Ekim 2026'da karkas işleyen borsalar.
+LIVESTOCK_EXCHANGES = {"5AN10": "Ankara TB", "5GA10": "Gaziantep TB", "5NA10": "Nazilli TB"}
 
 # Samsun TB ürün listesindeki ad -> veritabanı yem adı. Sayfa adresleri (slug) ürün
 # kimliği taşıdığı için sabit kodlanmaz; /urunler/ sayfasındaki bağlantılardan bulunur.
@@ -97,7 +127,8 @@ HAYVANCI_BASE_URL = "https://hayvanci.com/fiyatlar"
 HAYVANCI_PRODUCTS = {
     "saman": ("Buğday Samanı", "Arpa Samanı"),
     "yonca": ("Yonca Kuru Otu",),
-    "aycicegi-kuspesi": ("Ayçiçeği Küspesi",),
+    # Derecesiz "ayçiçeği küspesi" fiyatı sağmalların kullandığı %36'lık ürüne yazılır.
+    "aycicegi-kuspesi": ("Ayçiçeği Küspesi 36",),
     "arpa": ("Arpa",),
     "bugday": ("Buğday",),
     "misir": ("Mısır",),
@@ -116,8 +147,8 @@ DELIVERY_PREMIUM_TL_KG = {
 SAMSUN_PRODUCTS = {
     "BUĞDAY KEPEĞİ DÖKME": "Buğday Kepeği",
     "SAMAN (BUĞDAY)": "Buğday Samanı",
-    "AYÇİÇEK KÜSPESİ": "Ayçiçeği Küspesi",
-    "SOYA KÜSPESİ": "Soya Küspesi",
+    "AYÇİÇEK KÜSPESİ": "Ayçiçeği Küspesi 36",
+    "SOYA KÜSPESİ": "Soya Küspesi 46",
 }
 
 # Ürün adının devamında bunlardan biri geçiyorsa eşleme İPTAL edilir: dane değil,
@@ -293,21 +324,43 @@ class TurkishFeedPriceScraper:
             self.session.verify = _aia_ca_bundle(urlparse(url).hostname, self.timeout)
             return self.session.get(url, timeout=self.timeout, **kwargs)
 
+    def _exchange_rows(self, code: str) -> List[List[str]]:
+        """Bir TOBB borsasının fiyat tablosu satırları (hücre metinleri)."""
+        resp = self._get(TOBB_BASE_URL, params={"borsakod": code})
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        table = BeautifulSoup(resp.text, "html.parser").find("table")
+        if table is None:
+            return []
+        return [[c.get_text(" ", strip=True) for c in row.find_all("td")]
+                for row in table.find_all("tr")[1:]]
+
+    def exchange_codes(self) -> Dict[str, str]:
+        """Portaldaki borsalar (kod -> ad); okunamazsa hayvan işleyen bilinen borsalar."""
+        try:
+            resp = self._get(TOBB_INDEX_URL)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            codes = {}
+            for link in BeautifulSoup(resp.text, "html.parser").find_all("a", href=True):
+                match = re.search(r"borsakod=([^&\s]+)", link["href"])
+                if match:
+                    # "EDIRNE TICARET BORSASI" -> "Edirne TB"
+                    city = re.split(r"\s+T[Iİ]CARET\b", link.get_text(" ", strip=True))[0]
+                    codes[match.group(1)] = f"{city.capitalize()} TB"
+            if codes:
+                return codes
+        except Exception as exc:
+            logger.warning("TOBB borsa listesi çekilemedi: %s", exc)
+        return dict(LIVESTOCK_EXCHANGES)
+
     def scrape_exchange(self, code: str, label: str) -> List[FeedPrice]:
         """Tek bir borsanın fiyat tablosunu çeker."""
         prices: List[FeedPrice] = []
         cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
 
         try:
-            resp = self._get(TOBB_BASE_URL, params={"borsakod": code})
-            resp.raise_for_status()
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            table = BeautifulSoup(resp.text, "html.parser").find("table")
-            if table is None:
-                return prices
-
-            for row in table.find_all("tr")[1:]:
-                cells = [c.get_text(" ", strip=True) for c in row.find_all("td")]
+            for cells in self._exchange_rows(code):
                 if len(cells) < 6:
                     continue
 
@@ -337,6 +390,93 @@ class TurkishFeedPriceScraper:
             logger.warning("TOBB %s (%s) çekilemedi: %s", label, code, exc)
 
         return prices
+
+    def scrape_livestock(self) -> Dict[str, FeedPrice]:
+        """TOBB karkas fiyatları (UKON yedeği): borsaların ORTALAMA sütununun medyanı (TL/kg).
+
+        `base_prices` burada MarketPrice anahtarına göre taban fiyattır; akıl sağlığı bandı
+        aynı (0.3×–3×). Teslim farkı eklenmez — fiyat borsadaki işlem fiyatıdır.
+        """
+        cutoff = datetime.now() - timedelta(days=MAX_PRICE_AGE_DAYS)
+        collected: Dict[str, List[FeedPrice]] = {}
+        for code, label in self.exchange_codes().items():
+            try:
+                rows = self._exchange_rows(code)
+            except Exception as exc:
+                logger.warning("TOBB %s (%s) çekilemedi: %s", label, code, exc)
+                continue
+            for cells in rows:
+                if len(cells) < 6 or cells[1].strip().upper() not in ("KG", "KİLOGRAM"):
+                    continue
+                key = LIVESTOCK_PRODUCTS.get(re.sub(r"\s+", " ", _tr_upper(cells[0])).strip())
+                traded_at = _parse_date(cells[2])
+                if key is None or traded_at is None or traded_at < cutoff:
+                    continue
+                price = self._plausible_price(key, _parse_turkish_number(cells[5]))
+                if price is not None:
+                    collected.setdefault(key, []).append(FeedPrice(
+                        name=key, price_per_kg=round(price, 2), source=label,
+                        date=traded_at.date().isoformat()))
+
+        results: Dict[str, FeedPrice] = {}
+        for key, samples in collected.items():
+            newest = max(samples, key=lambda p: p.date)
+            sources = sorted({p.source for p in samples}, key=lambda src: src != newest.source)
+            results[key] = FeedPrice(
+                name=key,
+                price_per_kg=round(statistics.median(p.price_per_kg for p in samples), 2),
+                source=sources[0] + (f" +{len(sources) - 1} borsa" if len(sources) > 1 else ""),
+                date=newest.date,
+                sample_count=len(samples),
+            )
+        logger.info("Canlı kaynaklar: %d hayvan/karkas fiyatı bulundu", len(results))
+        return results
+
+    def scrape_ukon(self) -> Dict[str, FeedPrice]:
+        """UKON haftalık kesim fiyatları: Türkiye ortalaması ve bölgeler (TL/kg karkas).
+
+        Tablo: Bölge | Dana Bıçak TL/KG | Kuzu Bıçak TL/KG; "Ortalama" satırı Türkiye
+        ortalaması, "Değişim (%)" satırları atlanır. Tarih başlıkta: "(TL/KG) - 22.10.2026".
+        """
+        results: Dict[str, FeedPrice] = {}
+        try:
+            resp = self._get(UKON_URL)
+            resp.raise_for_status()
+            # Sayfa utf-8 diye bildiriyor ama Türkçe karakterler bozuk geliyor.
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
+            match = re.search(r"\(TL\s*/\s*KG\)\s*-\s*(\d{2}\.\d{2}\.\d{4})", soup.get_text(" "))
+            stamp = _parse_date(match.group(1)) if match else None
+            table = soup.find("table")
+            if stamp is None or table is None:
+                logger.warning("UKON: fiyat tablosu ya da tarihi bulunamadı")
+                return results
+            if stamp < datetime.now() - timedelta(days=UKON_MAX_AGE_DAYS):
+                logger.warning("UKON tablosu eski (%s), kullanılmadı", stamp.date())
+                return results
+            rows = [[c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                    for tr in table.find_all("tr")]
+            header = [_tr_upper(cell) for cell in rows[0]]
+            columns = {i: key for i, cell in enumerate(header)
+                       for word, key in UKON_COLUMNS.items() if cell.startswith(word)}
+            for cells in rows[1:]:
+                region = cells[0].strip()
+                if not region or "DEĞİŞİM" in _tr_upper(region):
+                    continue
+                for i, key in columns.items():
+                    if i >= len(cells):
+                        continue
+                    full_key = key if _tr_upper(region).startswith("ORTALAMA") else f"{key}@{region}"
+                    price = self._plausible_price(key, _parse_turkish_number(cells[i]))
+                    if price is not None:
+                        results[full_key] = FeedPrice(
+                            name=full_key, price_per_kg=round(price, 2),
+                            source="UKON" if full_key == key else f"UKON · {region}",
+                            date=stamp.date().isoformat())
+        except Exception as exc:
+            logger.warning("UKON fiyatları çekilemedi: %s", exc)
+        logger.info("UKON: %d kesim fiyatı bulundu", len(results))
+        return results
 
     def scrape_samsun(self) -> List[FeedPrice]:
         """Samsun TB ürün sayfalarından kepek, saman ve küspe fiyatlarını çeker.
@@ -556,6 +696,76 @@ def reset_manual_prices(db: Session) -> List[str]:
     if reset:
         db.commit()
     return reset
+
+
+def update_market_prices(
+    db: Session,
+    price_updates: Optional[Dict[str, float]] = None,
+) -> Dict[str, object]:
+    """Kesim (karkas) fiyatlarını (veya verilen sözlüğü) yazar.
+
+    UKON'dan (bölgeler dahil); UKON'un vermediği anahtar için TOBB karkas satırı.
+    Yem fiyatlarıyla aynı kurallar: canlı senkron elle girilen fiyatı ezmez, kaynak
+    bulunamazsa fiyatlara dokunulmaz. Bölge satırları ilk senkronda oluşturulur.
+    """
+    from .database import MANUAL_SOURCE
+
+    now = datetime.now()
+    rows = {row.key: row for row in db.query(MarketPrice).all()}
+    if price_updates is not None:
+        resolved = {key: (price, MANUAL_SOURCE) for key, price in price_updates.items()}
+    else:
+        scraper = TurkishFeedPriceScraper(
+            base_prices={key: row.price_per_kg for key, row in rows.items()})
+        scraped = {**scraper.scrape_livestock(), **scraper.scrape_ukon()}
+        resolved = {key: (fp.price_per_kg, f"{fp.source} · {fp.date}")
+                    for key, fp in scraped.items()}
+        for key in resolved:
+            if key not in rows and "@" in key:
+                base, region = key.split("@", 1)
+                if base in rows:
+                    rows[key] = MarketPrice(key=key, label=f"{rows[base].label} — {region}")
+                    db.add(rows[key])
+
+    updated, kept_manual = [], []
+    for key, (price, source) in resolved.items():
+        row = rows.get(key)
+        if row is None:
+            continue
+        if price_updates is None and row.price_source == MANUAL_SOURCE:
+            kept_manual.append(row.label)
+            continue
+        row.price_per_kg, row.price_source, row.price_updated_at = price, source, now
+        updated.append(row.label)
+    if updated:
+        db.commit()
+    return {"updated": updated, "kept_manual": kept_manual}
+
+
+def reset_market_prices(db: Session) -> List[str]:
+    """Elle girilen kesim fiyatlarını taban fiyata döndürür."""
+    from .database import BASELINE_SOURCE, MANUAL_SOURCE, seed_market_prices
+
+    reset = []
+    for row in db.query(MarketPrice).filter(MarketPrice.price_source == MANUAL_SOURCE).all():
+        row.price_source = BASELINE_SOURCE
+        reset.append(row.label)
+    if reset:
+        db.commit()
+        seed_market_prices(db)   # taban fiyatı ve tarihi geri yazar
+    return reset
+
+
+def last_live_sync(db: Session) -> Optional[datetime]:
+    """En son canlı senkronun zamanı (taban ve elle girilen fiyatlar sayılmaz)."""
+    from .database import BASELINE_SOURCE, MANUAL_SOURCE
+
+    stamps = [row.price_updated_at
+              for model in (Feed, MarketPrice)
+              for row in db.query(model.price_updated_at).filter(
+                  model.price_source.notin_((BASELINE_SOURCE, MANUAL_SOURCE)),
+                  model.price_updated_at.isnot(None)).all()]
+    return max(stamps) if stamps else None
 
 
 if __name__ == "__main__":

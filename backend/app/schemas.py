@@ -3,13 +3,16 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-AnimalGroup = Literal["lactating", "dry_faroff", "dry_closeup"]
+AnimalGroup = Literal["lactating", "dry_faroff", "dry_closeup", "beef", "lamb"]
 
 
 class AnimalProfileIn(BaseModel):
-    """Animal profile; NASEM 2021 targets are derived from it (requirements.py)."""
-    group: AnimalGroup = Field("lactating", description="lactating / dry_faroff / dry_closeup")
-    body_weight_kg: float = Field(650, ge=300, le=1000)
+    """Animal profile; ME + CP targets are derived from it (requirements.py).
+
+    Protein %, lactose, DIM, parity and BCS feed only the NASEM 2021 DMI comparison note.
+    """
+    group: AnimalGroup = Field("lactating", description="lactating / dry_faroff / dry_closeup / beef / lamb")
+    body_weight_kg: float = Field(650, ge=10, le=1000, description="Kuzu 10 kg'dan, besi danası 100 kg'dan başlar")
     milk_kg: float = Field(30, ge=0, le=70, description="Daily milk yield (ignored for dry cows)")
     fat_pct: float = Field(3.8, ge=2.0, le=6.5)
     true_protein_pct: float = Field(3.2, ge=2.4, le=4.5)
@@ -18,27 +21,36 @@ class AnimalProfileIn(BaseModel):
     multiparous: bool = Field(True, description="False = first lactation / heifer")
     bcs: float = Field(3.0, ge=1.0, le=5.0)
     days_pregnant: int = Field(0, ge=0, le=285, description="0 = not pregnant (dry groups use a default)")
+    # Besi sığırı (group="beef") ve kuzu besisi (group="lamb")
+    daily_gain_kg: float = Field(1.4, ge=0, le=2.5, description="Target daily live-weight gain (beef, lamb)")
+    days_on_feed: int = Field(60, ge=1, le=500, description="Day of the fattening period (forage step-up)")
 
 
 class RequirementsResponse(BaseModel):
-    """Daily requirements and the DM-concentration targets the solver gets."""
+    """Daily requirements (ME + CP system) and the DM-concentration targets the solver gets."""
     group: AnimalGroup
     group_label: str
     dm_intake_kg: float
-    nel_mcal_day: float
-    nel_min: float = Field(..., description="Mcal NEL/kg DM")
-    nel_max: float
-    mp_g_day: float
-    mp_min: float = Field(..., description="g metabolizable protein / kg DM")
-    cp_kg_day: float
-    cp_min: Optional[float] = Field(None, description="% DM — dry-cow floor only")
+    me_mcal_day: float = Field(..., description="Total ME requirement, Mcal/day")
+    me_min: float = Field(..., description="Mcal ME/kg DM")
+    me_max: float
+    cp_g_day: float = Field(..., description="Total crude protein requirement, g/day")
+    cp_min: float = Field(..., description="% DM")
     cp_max: float
+    calcium_g_day: float
+    phosphorus_g_day: float
     calcium_min: float = Field(..., description="g/kg DM (= % x 10)")
     calcium_max: float
     phosphorus_min: float = Field(..., description="g/kg DM (= % x 10)")
     phosphorus_max: float
+    water_l_day: float
     energy_deficit_mcal: float
+    nasem_dmi_kg: Optional[float] = Field(None, description="NASEM 2021 DMI, for comparison only")
+    achievable_gain_kg: Optional[float] = Field(
+        None, description="Beef: daily gain the DMI allows when the target needs a denser ration")
     notes: List[str]
+    ca_p_ratio_min: float
+    ca_p_ratio_max: float
     # Grubun rasyon kuralları — UI'nin kontrol kartları bunlara göre hedefte/dışı der.
     ndf_min: float
     ndf_max: float
@@ -46,6 +58,8 @@ class RequirementsResponse(BaseModel):
     forage_ratio_max: float
     starch_max: float = Field(..., description="% DM")
     fat_max: float = Field(..., description="Crude fat (EE) % DM")
+    health_cap_exempt: List[str] = Field(default_factory=list,
+                                         description="Feeds whose as-fed health cap this group skips")
 
 
 class FeedResponse(BaseModel):
@@ -56,12 +70,13 @@ class FeedResponse(BaseModel):
     name: str
     feed_type: str = Field(
         "unknown",
-        description="silage/hay/straw/grain/protein/byproduct/fat/mineral/salt — "
+        description="silage/hay/straw/grain/protein/byproduct/fat/npn/mineral/salt — "
                     "drives the solver's inclusion windows and the UI grouping",
     )
     price_per_kg: float = Field(..., ge=0, description="Price per kg (TL/kg, as-fed basis)")
     dry_matter: float = Field(..., ge=0, le=100, description="Dry matter %")
-    crude_protein: float = Field(..., ge=0, le=100, description="Crude protein % DM")
+    # Üre gibi protein olmayan azot kaynaklarının HP eşdeğeri %100'ü aşar (üre %292).
+    crude_protein: float = Field(..., ge=0, le=300, description="Crude protein % DM")
     metabolic_energy: float = Field(..., ge=0, description="Metabolic energy Mcal/kg DM")
     net_energy_lactation: float = Field(..., ge=0, description="Net energy for lactation Mcal/kg DM (NRC 2001)")
     ndf: float = Field(..., ge=0, le=100, description="Neutral detergent fiber % DM (NRC 2001)")
@@ -84,11 +99,11 @@ class FeedResponse(BaseModel):
 class OptimizationRequest(BaseModel):
     """Request body for POST /api/v1/optimize. All nutrient bounds are DM basis.
 
-    With `animal`, every target left as None is filled from the NASEM 2021 requirements
+    With `animal`, every target left as None is filled from the ME + CP requirements
     and the group's ration rules apply; explicitly sent targets always win. Without it
     the targets are exactly what is sent and the lactating rules apply.
     """
-    body_weight_kg: float = Field(600, ge=300, le=1000, description="Body weight in kg")
+    body_weight_kg: float = Field(600, ge=10, le=1000, description="Body weight in kg")
     selected_feed_names: List[str] = Field(default_factory=list, description="Feed names to include")
     animal: Optional[AnimalProfileIn] = Field(None, description="Derive targets + rules from this profile")
 
@@ -127,6 +142,7 @@ class OptimizationRequest(BaseModel):
     feed_price_overrides: Optional[Dict[str, float]] = Field(
         None, description="Feed name -> price TL/kg, overrides the database price"
     )
+    with_advice: bool = Field(False, description="Also return suggestions (each one re-solved)")
 
 
 class NutrientContent(BaseModel):
@@ -183,6 +199,15 @@ class ConstraintStatus(BaseModel):
     turkish_explanation: Optional[str] = None
 
 
+class Advice(BaseModel):
+    """One suggestion under a result (advisor.py). `add`/`remove` = feed names for "Öneriyi uygula"."""
+    kind: Literal["saglik", "ekonomi", "eksik", "fazla", "sinir", "ucuz"]
+    text: str
+    add: List[str] = Field(default_factory=list)
+    remove: List[str] = Field(default_factory=list)
+    saving_tl_day: Optional[float] = None
+
+
 class OptimizationResponse(BaseModel):
     """Optimization result shared by /optimize and the agent tool."""
     status: str
@@ -197,6 +222,65 @@ class OptimizationResponse(BaseModel):
     turkish_explanations: List[str]
     warnings: List[str]
     solver_details: Dict[str, Any]
+    advice: List[Advice] = Field(default_factory=list)
+
+
+class CompoundFeedType(BaseModel):
+    """A compound-feed (karma yem) target from the user's HP -> ME table. All AS-FED."""
+    key: str
+    label: str
+    group: str = Field(..., description="Table group: süt / buzağı / düve-kuru-besi başlangıç / besi")
+    cp_min: float = Field(..., description="Crude protein % as-fed")
+    cp_max: float
+    me_min: float = Field(..., description="ME kcal/kg as-fed")
+    me_max: float
+    ca_min: float = Field(..., description="Ca % as-fed")
+    ca_max: float
+    p_min: float = Field(..., description="P % as-fed")
+    fattening: bool = Field(False, description="Besi yemi: no soybean meal, grain:meal >= 6:1")
+
+
+class CompoundFeedRequest(BaseModel):
+    """Request body for POST /api/v1/compound-feed. Targets are AS-FED (per kg of the mix)."""
+    type_key: str = Field("sut_21", description="Preset from GET /compound-feed/types")
+    selected_feed_names: List[str] = Field(default_factory=list)
+    batch_kg: float = Field(1000.0, ge=50, le=50000, description="Batch size, kg as-fed")
+    # Hazır tipin üzerine yazar ("özel hedef"); boş bırakılan alan tipten gelir.
+    cp_min: Optional[float] = Field(None, ge=5, le=45, description="% as-fed")
+    cp_max: Optional[float] = Field(None, ge=5, le=50)
+    me_min: Optional[float] = Field(None, ge=1500, le=3600, description="kcal/kg as-fed")
+    me_max: Optional[float] = Field(None, ge=1500, le=3800)
+    feed_price_overrides: Optional[Dict[str, float]] = None
+    with_advice: bool = Field(False, description="Also return suggestions (each one re-solved)")
+
+
+class CompoundFeedLine(BaseModel):
+    """One ingredient of the batch, notebook-style: kg plus its HP and ME contribution."""
+    name: str
+    amount_kg: float
+    share_pct: float
+    cp_points: float = Field(..., description="Contribution to the mix's CP % (as-fed)")
+    me_kcal: float = Field(..., description="Contribution to the mix's ME kcal/kg (as-fed)")
+    price_per_kg: float
+    cost: float
+
+
+class CompoundFeedResponse(BaseModel):
+    status: str
+    mode: str = Field(..., description="hard / relaxed / infeasible")
+    batch_kg: float
+    lines: List[CompoundFeedLine]
+    cp_pct: float
+    me_kcal: float
+    ca_pct: float
+    p_pct: float
+    salt_pct: float
+    cost_total: float
+    cost_per_kg: float
+    target: CompoundFeedType
+    notes: List[str]
+    excluded_feeds: List[str] = Field(default_factory=list)
+    advice: List[Advice] = Field(default_factory=list)
 
 
 class AgentQuery(BaseModel):
@@ -236,3 +320,71 @@ class PriceSyncResponse(BaseModel):
     kept_manual_feeds: List[str] = Field(
         default_factory=list, description="Feeds left on the user's own saved price"
     )
+
+
+class MarketPriceResponse(BaseModel):
+    """A carcass (slaughter) price used by the fattening economics (TL/kg); regions as "<key>@<region>"."""
+    model_config = ConfigDict(from_attributes=True)
+
+    key: str
+    label: str
+    price_per_kg: float
+    price_source: Optional[str] = None
+    price_updated_at: Optional[datetime] = None
+
+
+class MarketPriceUpdate(BaseModel):
+    """A manually entered carcass (slaughter) price."""
+    key: str
+    price_per_kg: float = Field(..., gt=0)
+
+
+class EconomicsRequest(BaseModel):
+    """One fattening period, per head. Prices left empty come from `market_prices`."""
+    species: Literal["beef", "lamb"] = "beef"
+    head_count: int = Field(1, ge=1, le=100000)
+    start_weight_kg: float = Field(..., ge=10, le=900)
+    daily_gain_kg: float = Field(..., gt=0, le=2.5)
+    days: int = Field(..., ge=10, le=600)
+    selected_feed_names: List[str] = Field(default_factory=list)
+    feed_price_overrides: Optional[Dict[str, float]] = None
+    use_all_selected_feeds: bool = True
+    min_inclusion_pct_dm: float = Field(3.0, ge=0.0, le=20.0)
+    purchase_price: Optional[float] = Field(
+        None, gt=0, description="TL/kg live; empty = carcass price × dressing (valued at slaughter price)")
+    carcass_price: Optional[float] = Field(None, gt=0, description="TL/kg carcass (slaughter price)")
+    dressing_pct: Optional[float] = Field(None, ge=30, le=75)
+    region: Optional[str] = Field(None, description="UKON region for the carcass price; None = Türkiye average")
+    itemized_costs: bool = False
+    mortality_pct: Optional[float] = Field(None, ge=0, le=50)
+    vet_per_head: float = Field(0.0, ge=0)
+    labor_per_head_day: float = Field(0.0, ge=0)
+    interest_pct_year: float = Field(0.0, ge=0, le=200)
+    with_advice: bool = False
+
+
+class EconomicsResponse(BaseModel):
+    """Cost, revenue and profit of the period; `ration` is the mid-weight ration."""
+    species: str
+    head_count: int
+    days: int
+    start_weight_kg: float
+    end_weight_kg: float
+    mid_weight_kg: float
+    total_gain_kg: float
+    carcass_weight_kg: float
+    dressing_pct: float
+    prices: Dict[str, Dict[str, Any]] = Field(
+        ..., description="purchase/carcass: price_per_kg + source + updated_at")
+    feed_cost_per_day: float
+    feed_asfed_kg_total: float
+    feed_dm_kg_total: float
+    per_head: Dict[str, Any]
+    herd: Dict[str, Any]
+    profit_per_day: float
+    cost_per_kg_gain: float
+    feed_conversion: float = Field(..., description="kg DM per kg live-weight gain")
+    breakeven_carcass_price: float
+    warnings: List[str] = Field(default_factory=list)
+    ration: OptimizationResponse
+    advice: List[Advice] = Field(default_factory=list)
