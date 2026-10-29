@@ -540,10 +540,12 @@ def render_price_editor(selected_feeds: List[str], feeds_data: List[Dict],
         row["ME (kcal/kg)"] = round((feed.get("metabolic_energy") or 0) * (feed.get("dry_matter") or 0) * 10)
         rows.append(row)
     price_df = pd.DataFrame(rows)
-    # None'lu sütun "object" tipinde kalır ve hücrede "None" yazar; sayıya çevrilince boş görünür.
-    for column in ("Max kg/gün", "Kaç günlük"):
-        if column in price_df:
-            price_df[column] = pd.to_numeric(price_df[column])
+    # Salt okunur sütun: sınırı olmayan yem "—" gösterir (NumberColumn boş hücreye "None" yazıyordu).
+    if "Max kg/gün" in price_df:
+        cap_format = "{:.3f}" if small else "{:.1f}"
+        price_df["Max kg/gün"] = [("—" if pd.isna(v) else cap_format.format(v)) for v in price_df["Max kg/gün"]]
+    if "Kaç günlük" in price_df:
+        price_df["Kaç günlük"] = pd.to_numeric(price_df["Kaç günlük"])
 
     edited_prices = st.data_editor(
         price_df,
@@ -564,10 +566,9 @@ def render_price_editor(selected_feeds: List[str], feeds_data: List[Dict],
                 help=f"Fiyatın güncellendiği tarihten bu yana geçen süre; "
                      f"{STALE_PRICE_DAYS} günden eskisi uyarı verir.",
             ),
-            "Max kg/gün": st.column_config.NumberColumn(
-                format="%.3f" if small else "%.1f",
+            "Max kg/gün": st.column_config.TextColumn(
                 help="Hayvan sağlığı sınırı — canlı ağırlığa göre ölçeklenmiş günlük azami "
-                     "miktar. Boş ise as-fed sınırı yok. Bu sınır hiçbir koşulda aşılmaz.",
+                     "miktar. \"—\" ise as-fed sınırı yok. Bu sınır hiçbir koşulda aşılmaz.",
             ),
             "HP (%)": st.column_config.NumberColumn(
                 format="%.1f", help="Ham protein, yemin doğal (yaş) hali için."),
@@ -1049,9 +1050,12 @@ def render_economics_page() -> None:
                 "Faiz (yıllık %)", 0.0, 200.0, 0.0, 1.0, key="econ_interest",
                 help="Alış parası ve yem parasının besi boyunca bağlı kalmasının maliyeti.")
 
+    # Kaba yemsiz rasyon kurulamaz (kaba yem tabanı kuralı); hata yerine baştan söyle.
+    if not forages:
+        st.info("Hesap için en az bir kaba yem seç (silaj, kuru ot ya da saman).", icon=":material/info:")
     if st.button("Besi ekonomisini hesapla", type="primary", icon=":material/calculate:",
-                 width="stretch", disabled=not selected) \
-            or (st.session_state.pop("auto_calc_econ", False) and selected):
+                 width="stretch", disabled=not forages) \
+            or (st.session_state.pop("auto_calc_econ", False) and forages):
         payload = {
             "species": species, "head_count": int(head_count), "start_weight_kg": float(start_weight),
             "daily_gain_kg": float(daily_gain), "days": int(days), "selected_feed_names": selected,

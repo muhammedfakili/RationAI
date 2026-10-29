@@ -1,9 +1,14 @@
 # RationAI 🐄
 
-**Süt ineğiniz için en ucuz ama eksiksiz rasyonu saniyeler içinde hesaplayan ücretsiz bir yardımcı.**
+**Süt ineği, besi sığırı ve küçükbaş için en ucuz ama eksiksiz rasyonu saniyeler içinde
+hesaplayan ücretsiz bir yardımcı.**
 
-Elinizdeki yemleri seçin, ineğinizi tanıtın; RationAI hayvanın ihtiyacını tam karşılayan,
-sağlığını riske atmayan **en düşük maliyetli karışımı** kilogram kilogram çıkarsın.
+Elinizdeki yemleri seçin, hayvanınızı tanıtın; RationAI hayvanın ihtiyacını tam karşılayan,
+sağlığını riske atmayan **en düşük maliyetli karışımı** kilogram kilogram çıkarsın. Karma yem
+formülü hazırlar, bir besi döneminin kâr eder mi etmez mi olduğunu hesaplar ve sorularınızı
+sohbetle cevaplar.
+
+![RationAI günlük rasyon ekranı](frontend/assets/screenshots/rasyon.png)
 
 ---
 
@@ -22,15 +27,16 @@ payı, gebelik payı, kalsiyum, fosfor ve su — sonra elinizdeki yemlerle bu ih
 
 ## Kimler için?
 
-- **Süt sığırı yetiştiricileri** — kendi rasyonunu kendi hazırlamak isteyen çiftçiler
+- **Süt sığırı, besi ve küçükbaş yetiştiricileri** — kendi rasyonunu kendi hazırlamak isteyen çiftçiler
 - **Zooteknistler ve besleme danışmanları** — sahada hızlı rasyon taslağı için
 - **Yem bayileri ve kooperatifler** — müşterisine yem önerisi yapanlar
 - **Ziraat / veteriner öğrencileri** — rasyon mantığını uygulamalı görmek için
 
 ## Nasıl çalışır? 3 adım
 
-1. **İneğinizi tanıtın.** Grup (sağmal / kuru dönem), canlı ağırlık, günlük süt. İsterseniz süt yağı,
-   laktasyon günü ve gebelik gününü de girin — girmezseniz makul varsayılanlar kullanılır.
+1. **Hayvanınızı tanıtın.** Grup (sağmal / kuru dönem / besi sığırı / küçükbaş), canlı ağırlık,
+   günlük süt ya da hedef canlı ağırlık artışı. İsterseniz süt yağı, laktasyon günü ve gebelik
+   gününü de girin — girmezseniz makul varsayılanlar kullanılır.
 2. **Yemlerinizi seçin.** Silaj, kuru ot, saman, tahıl, küspe… 71 yemlik listeden elinizde
    olanları işaretleyin (en yaygınlar başta). Kendi alış fiyatınızı yazabilirsiniz.
 3. **"Rasyonu hesapla"ya basın.** Her yemden günde kaç kilo vereceğinizi, günlük ve aylık maliyeti
@@ -38,25 +44,11 @@ payı, gebelik payı, kalsiyum, fosfor ve su — sonra elinizdeki yemlerle bu ih
 
 ## Örnek sonuç
 
-600 kg, günde 30 litre süt veren, laktasyonun 150. gününde bir inek
-(Temmuz 2026 taban fiyatlarıyla):
+650 kg, günde 30 litre süt veren bir inek; mısır silajı, yonca, saman, tahıllar, bonkalite ve
+küspelerle (Ekim 2026 fiyatlarıyla). Rasyon günde **293 TL** tutuyor ve enerji (ME), ham protein,
+kalsiyum, fosfor, lif (NDF), kaba yem oranı ve nişasta hedeflerinin **hepsini** karşılıyor.
 
-| Yem | kg/gün (yaş) | TL/gün |
-|---|---:|---:|
-| Mısır silajı | 16.0 | 80.00 |
-| Buğday kepeği | 4.2 | 40.62 |
-| Mısır | 4.1 | 56.87 |
-| Yonca kuru otu | 2.6 | 47.13 |
-| Soya küspesi (%46) | 1.7 | 33.43 |
-| Buğday samanı | 1.7 | 9.39 |
-| Arpa | 0.7 | 9.69 |
-| Ayçiçeği küspesi (%36) | 0.6 | 11.52 |
-| Mermer tozu · DCP · tuz | 0.6 | 4.29 |
-| **Toplam** | **32.2** | **292.93** |
-
-**Litre süt başına yem maliyeti ≈ 9.8 TL** · aylık ≈ 8.790 TL.
-Rasyon; enerji (ME), ham protein, kalsiyum, fosfor, lif (NDF), kaba yem oranı ve nişasta
-hedeflerinin **hepsini** karşılıyor (19.2 kg kuru madde, 2775 kcal/kg KM, %16.1 HP).
+<img src="frontend/assets/screenshots/rasyon-sonuc.png" alt="Rasyon sonucu" width="560">
 
 ## İneğinizin sağlığını nasıl korur?
 
@@ -91,7 +83,7 @@ besinin kaçıncı gününde olduğunuz yeterli. RationAI:
 - Sonuçta **"bu rasyonla beklenen artış ~X kg/gün"** yazar; hedef artış hayvanın yiyebileceği
   rasyonla mümkün değilse ulaşılabilir artışı söyler.
 
-## Kuzu / toklu besisi
+## Küçükbaş besisi
 
 Hayvan grubunda **"Küçükbaş besisi"**ni seçin: canlı ağırlık, hedef günlük artış (gram) ve besi günü.
 
@@ -113,7 +105,7 @@ ağırlığı, günlük artış ve besi süresi. Elinizdeki yemleri işaretleyin
 - Hayvan alışı, yem ve diğer giderler (yemin 1/3'ü ya da kalem kalem: ölüm/fire, veteriner,
   işçilik, faiz) toplanır.
 - Satış, besicinin eti kesimhaneye sattığı gibi hesaplanır: bitiş ağırlığı × karkas randımanı ×
-  kesim fiyatı. Randımanı (dana %55, kuzu %45) değiştirebilirsiniz.
+  kesim fiyatı. Randımanı (dana %55, küçükbaş %45) değiştirebilirsiniz.
 - Baş başına ve sürü kârı, günlük kâr, 1 kg artışın maliyeti, yemden yararlanma ve **başabaş
   kesim fiyatı** (bunun altında besi zarar eder) gösterilir.
 - Kesim (karkas) fiyatı **UKON**'un kombina ve kesimhanelerden topladığı haftalık fiyattır;
@@ -121,6 +113,8 @@ ağırlığı, günlük artış ve besi süresi. Elinizdeki yemleri işaretleyin
   fiyatlarıyla birlikte **günde bir kez kendiliğinden günceller**.
 - Hayvanın **alış fiyatını girmeniz gerekmez**: hayvan o günkü kesim fiyatından değerlenir
   (alış = kesim fiyatı × randıman). İsterseniz kendi alış fiyatınızı yazarsınız.
+
+<img src="frontend/assets/screenshots/besi-ekonomisi.png" alt="Besi ekonomisi sonucu" width="560">
 
 ## Öneriler: ne yapmalısın?
 
@@ -155,7 +149,12 @@ sorabilirsiniz:
 
 Her sonucun altındaki **"Bu sonuç hakkında sor"** kutusuyla ekrandaki hesap hakkında soru
 sorabilir, sohbetteki bir sonucu **"ekranında aç"** ile ilgili sayfaya taşıyabilirsiniz.
-Rakamlar her zaman çözücüden gelir; yapay zekâ yalnızca anlatır. Sohbet için `.env`'ye ücretsiz
+Rakamlar her zaman çözücüden gelir; yapay zekâ yalnızca anlatır. Model araç kullanmadan kendi
+kafasından miktar yazarsa o cevap gösterilmez.
+
+![Asistan sohbet penceresi](frontend/assets/screenshots/asistan.png)
+
+ Sohbet için `.env`'ye ücretsiz
 bir NVIDIA (build.nvidia.com) ya da Groq anahtarı eklemek yeterli; anahtar olmadan da hesap
 ekranlarının hepsi çalışır.
 
@@ -173,6 +172,8 @@ ME katkısı, ton maliyeti.
   küspesi girmez ve dane:küspe en az 6:1 olur.
 - Vitamin-mineral premiks tonda 1 kg sabit; tuz, mermer tozu ve DCP'yi Ca/P hedefi belirler.
 
+<img src="frontend/assets/screenshots/karma-yem.png" alt="Karma yem sonucu" width="560">
+
 ## Güncel yem fiyatları
 
 Fiyatlar, **orta-büyük bir süt işletmesinin yemi çiftliğe teslim alırken ödediği ortalama
@@ -187,16 +188,11 @@ fiyat** olarak hesaplanır — tek bir satıcının değil, piyasanın ortalamas
 - **Teslim farkı:** saman ve kuru ot hacimli olduğu için +1,20 TL/kg, tahıl, küspe ve kepek
   dökme taşındığı için +0,50 TL/kg.
 - Mısır, arpa, buğday, yulaf, çavdar, nohut, buğday kepeği, ayçiçeği küspesi, saman ve yonca
-  canlı güncellenir. Silaj ve mineraller piyasada izlenmediği için taban fiyatta kalır; her fiyatın
+  canlı güncellenir. Silaj ve mineraller piyasada izlenmediği için taban fiyatta kalır (silaj:
+  Ekim 2026 birlik bültenleri, yıl ortalaması); her fiyatın
   kaç günlük olduğu tabloda yazar, eskiyenler uyarı verir.
 - **Kendi fiyatınız her zaman önce gelir:** tabloya alış fiyatınızı yazıp "Fiyatlarımı kaydet"e
   basarsanız sonraki hesaplarda da o kullanılır ve canlı güncelleme onu değiştirmez.
-
-## Soru da sorabilirsiniz
-
-Sohbet kutusuna Türkçe yazın: *"650 kiloluk, 35 litre veren ineğe silaj, yonca, arpa ve soyayla
-rasyon hazırla"* ya da *"Rasyonda nişasta neden sınırlanır?"*. Asistan rasyonu yine aynı hesap
-motoruyla yapar — miktarları kafasından yazmaz.
 
 ## Ücretsiz mi?
 
@@ -217,7 +213,7 @@ anahtarı gerekir; anahtar yoksa sohbet kapanır, geri kalan her şey çalışı
 **Docker ile (önerilen):**
 
 ```bash
-cp .env.example .env      # Groq anahtarı opsiyonel, boş bırakabilirsiniz
+cp .env.example .env      # NVIDIA / Groq anahtarı opsiyonel, boş bırakabilirsiniz
 docker compose up
 ```
 
@@ -237,20 +233,22 @@ python -m venv .venv
 ### Mimari
 
 ```
-Streamlit arayüz ──HTTP──▶ FastAPI ──▶ PuLP/CBC doğrusal programlama (rasyon çözücü)
-                                  ├──▶ requirements.py (ME + HP ihtiyaç modeli)
-                                  ├──▶ PostgreSQL / SQLite (yem tablosu, fiyatlar)
-                                  ├──▶ ChromaDB (bilgi tabanı araması)
-                                  └──▶ LangGraph ajanı → Groq LLM (opsiyonel sohbet)
+Streamlit arayüz ──HTTP──▶ FastAPI ──▶ PuLP/CBC doğrusal programlama (rasyon + karma yem çözücü)
+                                  ├──▶ requirements.py (süt, besi, küçükbaş ihtiyaç modeli)
+                                  ├──▶ economics.py / advisor.py (besi ekonomisi, doğrulanmış öneriler)
+                                  ├──▶ PostgreSQL / SQLite (yem tablosu, yem ve kesim fiyatları)
+                                  ├──▶ ChromaDB (bilgi tabanı: Türkçe anahtar kelime + vektör)
+                                  └──▶ Sohbet ajanı → NVIDIA NIM / Groq (opsiyonel, araç çağırma)
 ```
 
 - **İki ayrı yol:** "Rasyonu hesapla" butonu `POST /api/v1/optimize` üzerinden doğrudan çözücüye
   gider — LLM yoktur, sonuç tekrarlanabilir ve denetlenebilir. Sohbet (`/api/v1/agent/query`)
-  aynı çözücüyü araç olarak çağırır.
+  OpenAI uyumlu API ile yerel araç çağırma kullanır (LangChain yok) ve butonlarla aynı uç
+  noktaları araç olarak çağırır.
 - **İhtiyaç modeli:** zootekni ders notlarındaki formüller — kuru madde, metabolik enerji
   (yaşama + süt + gebelik payı), ham protein, Ca, P ve su ([data/notlar/rasyon_notlari.md](data/notlar/rasyon_notlari.md)).
-  Kuru inek KMT'si ve sağmal karşılaştırması için NASEM 2021. Sağmal, kuru (erken) ve kuru
-  (doğuma yakın) grupları için ayrı rasyon kuralları.
+  Kuru inek KMT'si ve sağmal karşılaştırması için NASEM 2021; besi sığırında NASEM 2016, küçükbaşta
+  NRC tabloları. Sağmal, kuru (erken), kuru (doğuma yakın), besi ve küçükbaş için ayrı rasyon kuralları.
 - **Yem değerleri:** HP ve ME, Türkiye'de kullanılan yem tablosundan (doğal hal) kuru madde
   bazına çevrilir; NDF, Ca, P, nişasta ve yağ NRC 2001'den.
 - **Çözücü:** iki aşamalı. Önce tüm besin hedefleri ve rasyon kuralları kesin kısıt olarak denenir;
@@ -261,9 +259,10 @@ Streamlit arayüz ──HTTP──▶ FastAPI ──▶ PuLP/CBC doğrusal progr
   karma yemin doğal hali için (1 kg yemde % HP, kcal ME, % Ca/P).
 - **Fiyatlar:** `borsa.tobb.org.tr`, `samsuntb.org.tr` ve `hayvanci.com/fiyatlar` kazınır,
   yem başına medyan alınıp yem tipine göre teslim farkı eklenir; her yem fiyat kaynağını ve
-  hesabını (`price_source`) taşır.
+  hesabını (`price_source`) taşır. Kesim fiyatları UKON'dan (bölge bazında) gelir; hepsi günde
+  bir kez kendiliğinden güncellenir.
 
 ### Teknoloji
 
-FastAPI · Streamlit · SQLAlchemy · PostgreSQL · PuLP (CBC) · ChromaDB · LangChain/LangGraph ·
-Groq (gpt-oss-120b) · Docker Compose
+FastAPI · Streamlit · Altair · SQLAlchemy · PostgreSQL · PuLP (CBC) · ChromaDB · BeautifulSoup ·
+NVIDIA NIM (Nemotron) / Groq · Docker Compose

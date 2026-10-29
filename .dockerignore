@@ -26,3 +26,6 @@ CLAUDE.md
 README.md
 
 # data/docs/ BİLEREK dışlanmadı: backend imajı build sırasında oradan ingest ediyor.
+
+# README ekran görüntüleri imaja gerekmez.
+frontend/assets/screenshots/
